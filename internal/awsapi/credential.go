@@ -15,19 +15,16 @@ const CredentialTypeName = "aws_sso"
 
 // ssoConfig is the decoded aws_sso credential body.
 //
-// ADR 0001 D3 models the per-account allowlist as repeated `account { … }`
-// blocks. The pluginsdk v0.5.3 schema (register.go ctyTypeFromString) only
-// accepts flat attributes of primitive / list-of-primitive types — nested
-// object blocks are not expressible — so this first cut carries a single
-// account as flat attributes (id / role_name / placeholder). Expanding to the
-// repeated-block allowlist is deferred until the SDK grows a block schema
-// (tracked with the allowlist slice); the login wiring below is unaffected.
+// ADR 0001 D3: the per-account allowlist is a flat `accounts = list(string)`
+// of 12-digit account ids. The pluginsdk v0.5.3 schema (register.go
+// ctyTypeFromString) only accepts flat attributes of primitive /
+// list-of-primitive types — nested `account { … }` blocks are not
+// expressible — so the per-account role guard and placeholder override are
+// deferred (option B): roles are auto-discovered and placeholders are derived.
 type ssoConfig struct {
-	StartURL    string `json:"start_url"`
-	Region      string `json:"region"`
-	AccountID   string `json:"account_id"`
-	RoleName    string `json:"role_name"`
-	Placeholder string `json:"placeholder"`
+	StartURL string   `json:"start_url"`
+	Region   string   `json:"region"`
+	Accounts []string `json:"accounts"`
 }
 
 // Credential declares the aws_sso credential type.
@@ -43,9 +40,7 @@ func Credential() pluginsdk.CredentialDef {
 		Schema: pluginsdk.Schema{Fields: []pluginsdk.SchemaField{
 			{Name: "start_url", TypeString: "string", Required: true},
 			{Name: "region", TypeString: "string", Required: true},
-			{Name: "account_id", TypeString: "string", Required: true},
-			{Name: "role_name", TypeString: "string"},
-			{Name: "placeholder", TypeString: "string"},
+			{Name: "accounts", TypeString: "list(string)", Required: true},
 		}},
 		Build: buildCredential,
 	}
@@ -65,8 +60,8 @@ func buildCredential(req pluginsdk.BuildRequest) (any, error) {
 		return nil, errors.New("aws_sso: region is required")
 	}
 
-	if cfg.AccountID == "" {
-		return nil, errors.New("aws_sso: account_id is required")
+	if err := validateAccounts(cfg.Accounts); err != nil {
+		return nil, err
 	}
 
 	return pluginsdk.CredentialBuildResult{
@@ -84,4 +79,42 @@ func buildCredential(req pluginsdk.BuildRequest) (any, error) {
 			},
 		},
 	}, nil
+}
+
+// validateAccounts enforces the allowlist invariants (ADR 0001 D3/D4): a
+// non-empty list of 12-digit account ids, each appearing at most once.
+func validateAccounts(accounts []string) error {
+	if len(accounts) == 0 {
+		return errors.New("aws_sso: accounts is required and must list at least one account id")
+	}
+
+	seen := make(map[string]struct{}, len(accounts))
+	for _, id := range accounts {
+		if !isAccountID(id) {
+			return fmt.Errorf("aws_sso: account %q is not a 12-digit account id", id)
+		}
+
+		if _, dup := seen[id]; dup {
+			return fmt.Errorf("aws_sso: duplicate account %q in accounts", id)
+		}
+
+		seen[id] = struct{}{}
+	}
+
+	return nil
+}
+
+// isAccountID reports whether s is exactly 12 decimal digits.
+func isAccountID(s string) bool {
+	if len(s) != 12 {
+		return false
+	}
+
+	for i := range len(s) {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+
+	return true
 }

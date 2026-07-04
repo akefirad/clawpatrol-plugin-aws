@@ -48,31 +48,38 @@ func Endpoint() pluginsdk.EndpointDef {
 		Family:   FacetName,
 		TLSMode:  pluginsdk.TLSTerminate,
 		HandleConn: func(ctx context.Context, conn *pluginsdk.Conn) error {
-			region, token, role, err := endpointParams(conn.CredentialCanonicalConfig, conn.CredentialSecret)
+			region, token, accounts, err := endpointParams(conn.CredentialCanonicalConfig, conn.CredentialSecret)
 			if err != nil {
 				return err
 			}
 
-			minter := awssso.New(region, token, credentialExpiryWindow)
+			allow := make(map[string]struct{}, len(accounts))
+			for _, id := range accounts {
+				allow[id] = struct{}{}
+			}
 
-			return handleConn(ctx, conn, minter, role)
+			minter := awssso.New(region, token, credentialExpiryWindow)
+			resolver := awssso.NewRoles(region, token)
+
+			return handleConn(ctx, conn, allow, minter, resolver)
 		},
 	}
 }
 
 // endpointParams reads the per-connection minting inputs off the gateway's
-// delivery: the SSO region and configured role from the credential's canonical
-// config, and the SSO access token from the credential's secret bytes (ADR
-// 0001 D9 — the gateway's OAuth flow delivers the token as
-// Conn.CredentialSecret). The account is not read here; it is decoded per
-// request from the SigV4 access-key id (ADR 0001 D5).
-func endpointParams(canonicalConfig, secret []byte) (region, token, role string, err error) {
+// delivery: the SSO region and the account allowlist from the credential's
+// canonical config, and the SSO access token from the credential's secret
+// bytes (ADR 0001 D9 — the gateway's OAuth flow delivers the token as
+// Conn.CredentialSecret). The target account is not read here; it is decoded
+// per request from the SigV4 access-key id (ADR 0001 D5) and matched against
+// the allowlist. The role is auto-discovered per account, not configured.
+func endpointParams(canonicalConfig, secret []byte) (region, token string, accounts []string, err error) {
 	var cfg ssoConfig
 	if err := json.Unmarshal(canonicalConfig, &cfg); err != nil {
-		return "", "", "", fmt.Errorf("decode aws_sso credential config: %w", err)
+		return "", "", nil, fmt.Errorf("decode aws_sso credential config: %w", err)
 	}
 
-	return cfg.Region, string(secret), cfg.RoleName, nil
+	return cfg.Region, string(secret), cfg.Accounts, nil
 }
 
 // upstreamPort is the AWS HTTPS port every brokered dial targets.
@@ -85,15 +92,27 @@ type roleMinter interface {
 	Credentials(ctx context.Context, account, role string) (aws.Credentials, error)
 }
 
+// roleResolver is the slice of *awssso.Roles that handleConn needs:
+// auto-discover (and cache) the single role for an account via
+// sso:ListAccountRoles (ADR 0001 D3). Narrowing to an interface keeps
+// handleConn unit-testable.
+type roleResolver interface {
+	Role(ctx context.Context, account string) (string, error)
+}
+
 // handleConn owns one agent connection: read each HTTP request, decode the
-// target account from the SigV4 access-key id, evaluate the aws facet, mint
-// short-lived SSO credentials for the configured role, re-sign with them, and
-// proxy upstream via the gateway's dial.
+// target account from the SigV4 access-key id, fail closed unless the account
+// is on the allowlist, evaluate the aws facet, resolve and mint short-lived
+// SSO credentials for the account's role, re-sign with them, and proxy
+// upstream via the gateway's dial.
 //
-// Credentials are minted live via sso:GetRoleCredentials and cached per
-// (account, role) by the minter (ADR 0001 D12): a burst reuses one mint, and
-// minting happens only after the verdict allows the request.
-func handleConn(ctx context.Context, conn gatewayConn, minter roleMinter, role string) error {
+// Dispatch is fail-closed (ADR 0001 D4/D5): a request with no parseable AKID,
+// or whose decoded account is not on the allowlist, is denied without
+// resolving a role, minting, or re-signing. Credentials are minted live via
+// sso:GetRoleCredentials and cached per (account, role) by the minter (ADR
+// 0001 D12): a burst reuses one mint, and minting happens only after the
+// verdict allows the request.
+func handleConn(ctx context.Context, conn gatewayConn, allow map[string]struct{}, minter roleMinter, resolver roleResolver) error {
 	br := bufio.NewReader(conn)
 	for {
 		req, err := http.ReadRequest(br)
@@ -105,7 +124,7 @@ func handleConn(ctx context.Context, conn gatewayConn, minter roleMinter, role s
 			return fmt.Errorf("read request: %w", err)
 		}
 
-		if err := handleRequest(ctx, conn, req, minter, role); err != nil {
+		if err := handleRequest(ctx, conn, req, allow, minter, resolver); err != nil {
 			return err
 		}
 
@@ -115,7 +134,7 @@ func handleConn(ctx context.Context, conn gatewayConn, minter roleMinter, role s
 	}
 }
 
-func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, minter roleMinter, role string) error {
+func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, allow map[string]struct{}, minter roleMinter, resolver roleResolver) error {
 	body, err := io.ReadAll(req.Body)
 	_ = req.Body.Close()
 
@@ -133,15 +152,21 @@ func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, min
 		return writeError(conn, req, "aws_api: no account encoded in the access-key id")
 	}
 
+	// Fail closed: an account outside the explicit allowlist is denied before
+	// any policy evaluation, role resolution, or mint (ADR 0001 D4).
+	if _, allowed := allow[account]; !allowed {
+		return writeError(conn, req, "aws_api: account "+account+" is not on the allowlist")
+	}
+
 	host := req.Host
 	service, region := awssign.ParseServiceRegion(host)
 
 	action := map[string]any{
-		"service":  service,
-		"account":  account,
-		"region":   region,
-		"resource": req.URL.Path,
-		"method":   req.Method,
+		fieldService:  service,
+		fieldAccount:  account,
+		fieldRegion:   region,
+		fieldResource: req.URL.Path,
+		fieldMethod:   req.Method,
 	}
 	summary := fmt.Sprintf("%s %s (%s/%s)", req.Method, service, account, region)
 
@@ -151,14 +176,33 @@ func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, min
 	}
 
 	switch verdict.Action {
-	case "allow", "hitl_allow":
+	case verdictAllow, verdictHITLAllow:
 		// proceed
 	default:
 		return writeError(conn, req, "aws_api: "+verdict.Reason)
 	}
 
-	// Mint only after the verdict allows, so a denied request never mints
-	// (ADR 0001 request flow). The minter caches per (account, role).
+	return forwardRequest(ctx, conn, req, body, account, host, service, region, minter, resolver)
+}
+
+// Verdict actions the gateway returns that permit the request to proceed; any
+// other action denies it.
+const (
+	verdictAllow     = "allow"
+	verdictHITLAllow = "hitl_allow"
+)
+
+// forwardRequest runs the allowed path: auto-discover (and cache) the account's
+// role, mint short-lived SSO credentials, re-sign, and proxy upstream via the
+// gateway's brokered dial. It runs only after the verdict allows, so a denied
+// request never resolves a role or mints (ADR 0001 request flow). The role is
+// cached per account and the minter caches per (account, role).
+func forwardRequest(ctx context.Context, conn gatewayConn, req *http.Request, body []byte, account, host, service, region string, minter roleMinter, resolver roleResolver) error {
+	role, err := resolver.Role(ctx, account)
+	if err != nil {
+		return fmt.Errorf("resolve role for account %s: %w", account, err)
+	}
+
 	creds, err := minter.Credentials(ctx, account, role)
 	if err != nil {
 		return fmt.Errorf("mint credentials: %w", err)
