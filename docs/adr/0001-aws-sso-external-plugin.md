@@ -252,6 +252,16 @@ Deferred to follow-ups (driven by real need):
 - rich `action` parsing + `iam_action` table + S3 operation reconstruction.
 - `aws-chunked` decode + `Expect: 100-continue` (S3 uploads / write bodies).
 - response `SetResult` (status + response-body tap).
+- **cross-connection cache sharing (#10):** Slice 2 builds the minter +
+  `aws.CredentialsCache` **per connection**, so single-flight/expiry apply within a
+  keep-alive connection but separate connections re-mint. A shared
+  per-credential-instance cache keyed by `(account, role)` (SSO token threaded
+  per-mint) is deferred to #10.
+- **redaction of minted creds:** pluginsdk v0.5.3 exposes no redaction hook to an
+  endpoint plugin's `HandleConn` (only the built-in HTTPS inject/transform path has
+  `Redactions`). Exposure is low — the plugin proxies the re-signed request itself
+  via the brokered dial, and the gateway audits via the `aws` facet (no cred
+  material), not the re-signed bytes. Deferred pending a pluginsdk hook.
 
 ### D13 — Re-authentication is surfaced actively (expired-token UX)
 
