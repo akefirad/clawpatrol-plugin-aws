@@ -1,0 +1,112 @@
+package awsact
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
+
+// Reused S3 request paths (object key vs. bucket root).
+const (
+	s3ObjectKey  = "/bucket/key.txt"
+	s3BucketPath = "/bucket"
+)
+
+// newRequest builds a request the way handleConn hands one to the parser:
+// method, an absolute URL (so req.URL carries the path + raw query), and a
+// host. headers is applied last.
+func newRequest(t *testing.T, method, host, target string, headers map[string]string) *http.Request {
+	t.Helper()
+
+	req := httptest.NewRequestWithContext(context.Background(), method, "https://"+host+target, nil)
+	req.Host = host
+
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	return req
+}
+
+func TestAction_S3REST(t *testing.T) {
+	t.Parallel()
+
+	const host = "s3.amazonaws.com"
+
+	cases := []struct {
+		name   string
+		method string
+		target string
+		header map[string]string
+		want   string
+	}{
+		{name: "get object", method: http.MethodGet, target: s3ObjectKey, want: "GetObject"},
+		{name: "head object", method: http.MethodHead, target: s3ObjectKey, want: "HeadObject"},
+		{name: "put object", method: http.MethodPut, target: s3ObjectKey, want: "PutObject"},
+		{name: "delete object", method: http.MethodDelete, target: s3ObjectKey, want: "DeleteObject"},
+		{name: "copy object", method: http.MethodPut, target: s3ObjectKey, header: map[string]string{"X-Amz-Copy-Source": "/other/src"}, want: "CopyObject"},
+		{name: "list buckets", method: http.MethodGet, target: "/", want: "ListBuckets"},
+		{name: "list objects v1", method: http.MethodGet, target: s3BucketPath, want: "ListObjects"},
+		{name: "list objects v2", method: http.MethodGet, target: s3BucketPath + "?list-type=2", want: "ListObjectsV2"},
+		{name: "head bucket", method: http.MethodHead, target: s3BucketPath, want: "HeadBucket"},
+		{name: "create bucket", method: http.MethodPut, target: s3BucketPath, want: "CreateBucket"},
+		{name: "delete bucket", method: http.MethodDelete, target: s3BucketPath, want: "DeleteBucket"},
+		{name: "list object versions subresource", method: http.MethodGet, target: s3BucketPath + "?versions", want: "ListObjectVersions"},
+		{name: "get bucket acl subresource", method: http.MethodGet, target: s3BucketPath + "?acl", want: "GetBucketAcl"},
+		{name: "get object tagging subresource", method: http.MethodGet, target: s3ObjectKey + "?tagging", want: "GetObjectTagging"},
+		{name: "multipart initiate", method: http.MethodPost, target: s3ObjectKey + "?uploads", want: "CreateMultipartUpload"},
+		{name: "delete objects batch", method: http.MethodPost, target: s3BucketPath + "?delete", want: "DeleteObjects"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			req := newRequest(t, tc.method, host, tc.target, tc.header)
+			assert.Equal(t, tc.want, Action(req, nil, "s3"))
+		})
+	}
+}
+
+func TestAction_JSONProtocolTarget(t *testing.T) {
+	t.Parallel()
+
+	req := newRequest(t, http.MethodPost, "dynamodb.us-east-1.amazonaws.com", "/", map[string]string{
+		"X-Amz-Target": "DynamoDB_20120810.PutItem",
+	})
+
+	assert.Equal(t, "PutItem", Action(req, nil, "dynamodb"))
+}
+
+func TestAction_QueryProtocolFormAction(t *testing.T) {
+	t.Parallel()
+
+	body := []byte("Action=DescribeInstances&Version=2016-11-15")
+	req := newRequest(t, http.MethodPost, "ec2.eu-central-1.amazonaws.com", "/", map[string]string{
+		"Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+	})
+
+	assert.Equal(t, "DescribeInstances", Action(req, body, "ec2"))
+}
+
+func TestAction_QueryProtocolURLAction(t *testing.T) {
+	t.Parallel()
+
+	req := newRequest(t, http.MethodGet, "sts.amazonaws.com", "/?Action=GetCallerIdentity&Version=2011-06-15", nil)
+
+	assert.Equal(t, "GetCallerIdentity", Action(req, nil, "sts"))
+}
+
+func TestAction_FallbackMethodPath(t *testing.T) {
+	t.Parallel()
+
+	// An unknown service with no X-Amz-Target and no Action param: the verb is
+	// unknowable, so it falls back to "METHOD path" (which matches no read
+	// prefix and is gated as a mutation).
+	req := newRequest(t, http.MethodGet, "unknownsvc.eu-central-1.amazonaws.com", "/some/resource", nil)
+
+	assert.Equal(t, "GET /some/resource", Action(req, nil, "unknownsvc"))
+}

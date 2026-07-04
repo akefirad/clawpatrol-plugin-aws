@@ -9,21 +9,30 @@ const FacetName = "aws"
 // Facet field names. Shared between the facet declaration and the endpoint's
 // per-request action map so the two never drift.
 const (
-	fieldService  = "service"
-	fieldAccount  = "account"
-	fieldRegion   = "region"
-	fieldResource = "resource"
-	fieldMethod   = "method"
+	fieldService   = "service"
+	fieldAction    = "action"
+	fieldIAMAction = "iam_action"
+	fieldAccount   = "account"
+	fieldRegion    = "region"
+	fieldResource  = "resource"
+	fieldMethod    = "method"
 )
 
-// Facet is the minimal AWS facet for the first cut (ADR 0001 D12): the fields
-// gateway CEL rules can match a request on. Richer fields (action,
-// iam_action, account_name, response taps) are deferred to later slices.
+// Facet is the AWS facet gateway CEL rules match a request on (ADR 0001 D8).
+//
+// action is the CloudTrail operation name (the audit verb) — always present,
+// so it is the facet's Title (the activity log shows it instead of the HTTP
+// method). iam_action is the permission-shaped action, best-effort: it is
+// Optional and omitted (not "") when undeterminable, so an allow rule matching
+// on it fails closed rather than matching a guess (D8). account_name and the
+// response taps stay deferred to later slices.
 func Facet() pluginsdk.FacetDef {
 	return pluginsdk.FacetDef{
 		Name: FacetName,
 		Fields: []pluginsdk.FacetField{
-			{Name: fieldService, Kind: pluginsdk.FacetString, Label: "Service", Description: "AWS service (from the request host)"},
+			{Name: fieldAction, Kind: pluginsdk.FacetString, Label: "Action", Description: "API action (CloudTrail operation)", Title: true},
+			{Name: fieldIAMAction, Kind: pluginsdk.FacetString, Label: "IAM action", Description: "IAM policy action (best-effort; e.g. s3:GetObject)", Optional: true},
+			{Name: fieldService, Kind: pluginsdk.FacetString, Label: "Service", Description: "AWS service (from the request host)", DetailOnly: true},
 			{Name: fieldAccount, Kind: pluginsdk.FacetString, Label: "Account", Description: "Target account (decoded from the request's access-key id)"},
 			{Name: fieldRegion, Kind: pluginsdk.FacetString, Label: "Region", Description: "Signing region (from the request host)"},
 			{Name: fieldResource, Kind: pluginsdk.FacetString, Label: "Resource", Description: "Request path"},
