@@ -34,6 +34,7 @@ const (
 	testRole            = "ReadOnly"
 	testSSORegion       = "eu-central-1"
 	testSSOToken        = "sso-access-token-xyz" // delivered as Conn.CredentialSecret
+	testCredInstance    = "prod-aws"             // the aws_sso credential instance name
 	testHost            = "sts.us-east-1.amazonaws.com"
 	testBody            = `{"Action":"GetCallerIdentity","Version":"2011-06-15"}`
 
@@ -227,7 +228,7 @@ func TestHandleConn_AllowedAccountMintsAndReSigns(t *testing.T) {
 	}
 	resolver := &fakeResolver{role: testRole}
 
-	err := handleConn(context.Background(), conn, allowlist(testAccount), mock.minter(), resolver)
+	err := handleConn(context.Background(), conn, allowlist(testAccount), mock.minter(), resolver, testCredInstance, true)
 	must.NoError(err)
 
 	// The account on the allowlist resolved its role and proceeded.
@@ -320,7 +321,7 @@ func TestHandleConn_S3PutObjectChunkedReSigns(t *testing.T) {
 	}
 	resolver := &fakeResolver{role: testRole}
 
-	err := handleConn(context.Background(), conn, allowlist(testAccount), mock.minter(), resolver)
+	err := handleConn(context.Background(), conn, allowlist(testAccount), mock.minter(), resolver, testCredInstance, true)
 	must.NoError(err)
 
 	// The enriched facet reached Evaluate with the reconstructed S3 op.
@@ -379,7 +380,7 @@ func TestHandleConn_HITLAllowProceeds(t *testing.T) {
 	}
 	resolver := &fakeResolver{role: testRole}
 
-	err := handleConn(context.Background(), conn, allowlist(testAccount), mock.minter(), resolver)
+	err := handleConn(context.Background(), conn, allowlist(testAccount), mock.minter(), resolver, testCredInstance, true)
 	must.NoError(err)
 
 	// The approved request resolved its role, minted fresh, and dialed upstream.
@@ -413,7 +414,7 @@ func TestHandleConn_DenyVerdictsBlock(t *testing.T) {
 			minter := &fakeMinter{}
 			resolver := &fakeResolver{role: testRole}
 
-			err := handleConn(context.Background(), conn, allowlist(testAccount), minter, resolver)
+			err := handleConn(context.Background(), conn, allowlist(testAccount), minter, resolver, testCredInstance, true)
 			require.NoError(t, err)
 
 			// The account is on the allowlist, so it was evaluated — but the
@@ -422,6 +423,45 @@ func TestHandleConn_DenyVerdictsBlock(t *testing.T) {
 			denied(t, conn, minter, resolver)
 		})
 	}
+}
+
+// TestHandleConn_ExpiredSessionSurfacesReauth proves ADR 0001 D13: when the
+// gateway delivers no live SSO token (an empty CredentialSecret, session expired
+// with no refresh), a well-formed on-allowlist request that would otherwise be
+// served is denied with a recognizable re-auth error naming the credential — not
+// a mint attempt, not a dial, and no token/secret material in the response.
+func TestHandleConn_ExpiredSessionSurfacesReauth(t *testing.T) {
+	t.Parallel()
+
+	is := assert.New(t)
+	must := require.New(t)
+
+	conn := &fakeConn{
+		incoming: bytes.NewReader([]byte(rawRequest(testPlaceholderAKID))),
+		verdict:  pluginsdk.Verdict{Action: verdictAllow}, // would otherwise be served
+	}
+	minter := &fakeMinter{}
+	resolver := &fakeResolver{role: testRole}
+
+	// hasToken=false models the empty CredentialSecret the gateway delivers on an
+	// expired session.
+	err := handleConn(context.Background(), conn, allowlist(testAccount), minter, resolver, testCredInstance, false)
+	must.NoError(err)
+
+	// Denied with a recognizable re-auth error naming the credential — no SSO work.
+	status, body := agentResponse(t, conn)
+	is.Equal(http.StatusForbidden, status)
+	is.Contains(string(body), "AWS SSO session expired")
+	is.Contains(string(body), testCredInstance)
+	is.Contains(string(body), "dashboard")
+
+	// No token or credential material leaks into the response.
+	is.NotContains(string(body), testSSOToken)
+
+	// The doomed request never resolved a role, minted, or dialed upstream.
+	is.Equal(0, resolver.calls, "expired session must not resolve a role")
+	is.Equal(0, minter.calls, "expired session must not mint credentials")
+	is.Empty(conn.dialAddr, "expired session must not dial upstream")
 }
 
 // runAllowed drives the allow path against a canned raw upstream response and
@@ -437,7 +477,7 @@ func runAllowed(t *testing.T, rawResponse string) *fakeConn {
 		upstream: &fakeUpstream{response: bytes.NewReader([]byte(rawResponse))},
 	}
 
-	err := handleConn(context.Background(), conn, allowlist(testAccount), mock.minter(), &fakeResolver{role: testRole})
+	err := handleConn(context.Background(), conn, allowlist(testAccount), mock.minter(), &fakeResolver{role: testRole}, testCredInstance, true)
 	require.NoError(t, err)
 
 	return conn
@@ -549,7 +589,7 @@ func TestReportResponse_SetResultFailureIsBestEffort(t *testing.T) {
 
 	// A SetResult failure must not fail the request — the agent already has its
 	// response.
-	err := handleConn(context.Background(), conn, allowlist(testAccount), mock.minter(), &fakeResolver{role: testRole})
+	err := handleConn(context.Background(), conn, allowlist(testAccount), mock.minter(), &fakeResolver{role: testRole}, testCredInstance, true)
 	must.NoError(err)
 
 	_, body := agentResponse(t, conn)
@@ -588,7 +628,7 @@ func TestHandleConn_UnknownAccountDenied(t *testing.T) {
 	resolver := &fakeResolver{role: testRole}
 
 	// testAccount is not on the allowlist.
-	err := handleConn(context.Background(), conn, allowlist("999999999999"), minter, resolver)
+	err := handleConn(context.Background(), conn, allowlist("999999999999"), minter, resolver, testCredInstance, true)
 	require.NoError(t, err)
 
 	denied(t, conn, minter, resolver)
@@ -604,7 +644,7 @@ func TestHandleConn_NoAKIDDenied(t *testing.T) {
 	minter := &fakeMinter{}
 	resolver := &fakeResolver{role: testRole}
 
-	err := handleConn(context.Background(), conn, allowlist(testAccount), minter, resolver)
+	err := handleConn(context.Background(), conn, allowlist(testAccount), minter, resolver, testCredInstance, true)
 	require.NoError(t, err)
 
 	denied(t, conn, minter, resolver)
@@ -657,7 +697,7 @@ func TestFacetCoverage_ExampleRuleFields(t *testing.T) {
 				verdict:  pluginsdk.Verdict{Action: verdictDeny}, // deny: capture the facet, no mint
 			}
 
-			err := handleConn(context.Background(), conn, allowlist(testAccount), &fakeMinter{}, &fakeResolver{role: testRole})
+			err := handleConn(context.Background(), conn, allowlist(testAccount), &fakeMinter{}, &fakeResolver{role: testRole}, testCredInstance, true)
 			must.NoError(err)
 			must.NotNil(conn.evalAction)
 
