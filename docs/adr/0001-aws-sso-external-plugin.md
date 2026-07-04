@@ -303,21 +303,22 @@ in-core AWS SSO flow.
 
 1. Gateway routes by host → this endpoint; terminates TLS; delivers the current
    SSO token as `Conn.CredentialSecret`.
-2. Plugin reads the HTTP request; decodes the **account** from the AKID; rejects
-   if the account is not on the credential's allowlist.
-3. Resolves the **role** (config `role_name`, or the singleton from
-   `ListAccountRoles`).
-4. Builds the `aws` facet and calls `conn.Evaluate` — **before** minting, so a
-   denied request never mints credentials, and a request routed to a human
+2. Plugin reads the HTTP request; decodes the **account** from the AKID; **fails
+   closed before any SSO call** if there is no parseable AKID or the account is not
+   on the credential's allowlist.
+3. Builds the `aws` facet and calls `conn.Evaluate` — **before** any SSO call or
+   mint, so a denied request does no SSO work, and a request routed to a human
    approver **blocks synchronously** on `Evaluate` (which walks the `approve`
    chain) until the decision or the request timeout.
-5. On allow: mint via `GetRoleCredentials` → SigV4 re-sign (region from host) →
-   `conn.DialUpstream` to the AWS host.
+4. On allow: resolve the **role** (the singleton from `ListAccountRoles`, cached
+   per account) → mint via `GetRoleCredentials` → SigV4 re-sign (region from host)
+   → `conn.DialUpstream` to the AWS host.
 
 Minting is **after** the verdict, so a request approved after a delay is signed
 with freshly minted credentials. The per-role credential cache is
 **expiry-window + single-flight** — a burst triggers at most one
-`GetRoleCredentials` per role. Under Path A the SSO token is re-delivered as
+`GetRoleCredentials` per role (per connection in the first cut; cross-connection
+sharing → #10). Under Path A the SSO token is re-delivered as
 `Conn.CredentialSecret` on every connection, so the in-memory caches repopulate
 naturally after a plugin/gateway restart — no re-authentication.
 
