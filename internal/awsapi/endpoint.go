@@ -39,6 +39,7 @@ type gatewayConn interface {
 	Evaluate(ctx context.Context, facet string, action map[string]any, summary string) (pluginsdk.Verdict, error)
 	DialUpstream(ctx context.Context, network, addr string, opts *pluginsdk.DialUpstreamOptions) (net.Conn, error)
 	SetResult(ctx context.Context, result map[string]any) error
+	Emit(ev pluginsdk.ConnEvent)
 }
 
 // resultConn is the slice of gatewayConn reportResponse needs: write the
@@ -70,7 +71,11 @@ func Endpoint() pluginsdk.EndpointDef {
 			minter := awssso.New(region, token, credentialExpiryWindow)
 			resolver := awssso.NewRoles(region, token)
 
-			return handleConn(ctx, conn, allow, minter, resolver)
+			// An empty token is an expired SSO session with no valid refresh (ADR
+			// 0001 D13): the gateway delivers no CredentialSecret. Thread the
+			// credential instance name so a would-be-served request can surface a
+			// recognizable re-auth error instead of failing at mint.
+			return handleConn(ctx, conn, allow, minter, resolver, conn.CredentialInstance, token != "")
 		},
 	}
 }
@@ -121,7 +126,7 @@ type roleResolver interface {
 // sso:GetRoleCredentials and cached per (account, role) by the minter (ADR
 // 0001 D12): a burst reuses one mint, and minting happens only after the
 // verdict allows the request.
-func handleConn(ctx context.Context, conn gatewayConn, allow map[string]struct{}, minter roleMinter, resolver roleResolver) error {
+func handleConn(ctx context.Context, conn gatewayConn, allow map[string]struct{}, minter roleMinter, resolver roleResolver, credInstance string, hasToken bool) error {
 	br := bufio.NewReader(conn)
 	for {
 		req, err := http.ReadRequest(br)
@@ -133,7 +138,7 @@ func handleConn(ctx context.Context, conn gatewayConn, allow map[string]struct{}
 			return fmt.Errorf("read request: %w", err)
 		}
 
-		if err := handleRequest(ctx, conn, req, allow, minter, resolver); err != nil {
+		if err := handleRequest(ctx, conn, req, allow, minter, resolver, credInstance, hasToken); err != nil {
 			return err
 		}
 
@@ -143,7 +148,7 @@ func handleConn(ctx context.Context, conn gatewayConn, allow map[string]struct{}
 	}
 }
 
-func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, allow map[string]struct{}, minter roleMinter, resolver roleResolver) error {
+func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, allow map[string]struct{}, minter roleMinter, resolver roleResolver, credInstance string, hasToken bool) error {
 	// Acknowledge Expect: 100-continue before reading the body so an agent that
 	// waits for the go-ahead (S3 uploads do) streams it (ADR 0001 D12 write path).
 	if err := awssign.Ack100Continue(conn, req.Header); err != nil {
@@ -220,7 +225,41 @@ func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, all
 		return writeError(conn, req, "aws_api: "+verdict.Reason)
 	}
 
+	// The verdict would let this request through, but the SSO session expired with
+	// no live token (empty CredentialSecret). Surface the re-auth need actively
+	// instead of failing opaquely at mint (ADR 0001 D13): deny with a recognizable
+	// error naming the credential. The token-needing step (role resolve + mint) is
+	// never reached, so no SSO work happens on this path.
+	if !hasToken {
+		reason := reauthReason(credInstance)
+
+		// Supplementary activity-stream marker (ADR 0001 D13): the Connect card is
+		// the primary expiry signal, but an audit event makes the denied request
+		// visible in the stream. It is a session condition, not a rule verdict, so
+		// it is emitted as an error event — not a fabricated allow/deny.
+		conn.Emit(pluginsdk.ConnEvent{
+			Action:  connEventError,
+			Reason:  reason,
+			Verb:    action,
+			Summary: summary,
+			Facets:  facet,
+		})
+
+		return writeError(conn, req, reason)
+	}
+
 	return forwardRequest(ctx, conn, req, body, account, host, service, region, minter, resolver)
+}
+
+// reauthReason is the recognizable re-auth error surfaced to the agent when the
+// SSO session has expired (ADR 0001 D13). It names the credential instance and
+// directs the operator to reconnect in the clawpatrol dashboard — no dashboard
+// URL is configured in this cut, and no token or credential material is included.
+func reauthReason(credInstance string) string {
+	return fmt.Sprintf(
+		"aws_sso: AWS SSO session expired; an operator must reconnect the %q credential in the clawpatrol dashboard",
+		credInstance,
+	)
 }
 
 // Verdict actions the gateway returns (pluginsdk.Verdict.Action). allow and
@@ -232,6 +271,12 @@ const (
 	verdictDeny      = "deny"
 	verdictHITLDeny  = "hitl_deny"
 )
+
+// connEventError is the ConnEvent.Action for the supplementary re-auth audit
+// marker (ADR 0001 D13). The event records a session condition (an expired SSO
+// token), not a rule decision, so it uses "error" rather than a fabricated
+// allow/deny verdict no rule produced.
+const connEventError = "error"
 
 // forwardRequest runs the allowed path: auto-discover (and cache) the account's
 // role, mint short-lived SSO credentials, re-sign, and proxy upstream via the
