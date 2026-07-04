@@ -22,20 +22,9 @@ import (
 )
 
 // ssoClientFunc builds an SSO client for a region. It is the overridable
-// sso-client seam: production uses newSSOClient, tests point it at a mock
-// server.
+// sso-client seam: production defaults it to a brokered client (built from the
+// gateway dial threaded into New), tests point it at a mock server.
 type ssoClientFunc func(region string) *sso.Client
-
-// newSSOClient is the default sso-client seam. It builds an anonymous-auth
-// client for the SSO region (GetRoleCredentials authenticates with the bearer
-// token, not SigV4). Each Minter captures it at construction so tests can
-// override per instance without racing on shared package state.
-var newSSOClient ssoClientFunc = func(region string) *sso.Client {
-	return sso.New(sso.Options{
-		Region:      region,
-		Credentials: aws.AnonymousCredentials{},
-	})
-}
 
 // cacheKey identifies one credential cache: temporary credentials are minted
 // and cached per target account and role.
@@ -61,20 +50,23 @@ type Minter struct {
 type Option func(*Minter)
 
 // WithClientFunc overrides the sso-client seam — the way a Minter builds its
-// SSO client. Production leaves it defaulted to newSSOClient; tests pass a
-// factory pointed at a mock server.
+// SSO client. Production leaves it defaulted to the brokered client; tests pass
+// a factory pointed at a mock server.
 func WithClientFunc(fn ssoClientFunc) Option {
 	return func(m *Minter) { m.newClient = fn }
 }
 
 // New builds a Minter for the SSO region and access token, with expiryWindow
-// as the refresh margin applied to every cached credential.
-func New(region, token string, expiryWindow time.Duration, opts ...Option) *Minter {
+// as the refresh margin applied to every cached credential. dial is the
+// gateway's brokered dial (pluginsdk.Conn.DialUpstream): the SSO client routes
+// every sso:GetRoleCredentials call through it, since the plugin has no network
+// of its own (ADR 0001 Capabilities).
+func New(region, token string, expiryWindow time.Duration, dial DialFunc, opts ...Option) *Minter {
 	m := &Minter{
 		region:       region,
 		token:        token,
 		expiryWindow: expiryWindow,
-		newClient:    newSSOClient,
+		newClient:    func(r string) *sso.Client { return newSSOClient(r, dial) },
 		caches:       make(map[cacheKey]*aws.CredentialsCache),
 	}
 

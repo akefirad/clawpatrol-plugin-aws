@@ -94,7 +94,7 @@ func (m *mockSSO) lastToken() string {
 // tests exercise the real GetRoleCredentials request/response path without
 // racing on shared package state.
 func (m *mockSSO) mint(region, token string, window time.Duration) *Minter {
-	return New(region, token, window, WithClientFunc(func(region string) *sso.Client {
+	return New(region, token, window, nil, WithClientFunc(func(region string) *sso.Client {
 		return sso.New(sso.Options{
 			Region:       region,
 			BaseEndpoint: aws.String(m.server.URL),

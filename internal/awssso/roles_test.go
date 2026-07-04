@@ -60,7 +60,7 @@ func newMockRolesSSO(t *testing.T, roles ...string) *mockRolesSSO {
 }
 
 func (m *mockRolesSSO) resolver(region, token string) *Roles {
-	return NewRoles(region, token, WithRolesClientFunc(func(region string) *sso.Client {
+	return NewRoles(region, token, nil, WithRolesClientFunc(func(region string) *sso.Client {
 		return sso.New(sso.Options{
 			Region:       region,
 			BaseEndpoint: aws.String(m.server.URL),
