@@ -39,6 +39,7 @@ type gatewayConn interface {
 	Evaluate(ctx context.Context, facet string, action map[string]any, summary string) (pluginsdk.Verdict, error)
 	DialUpstream(ctx context.Context, network, addr string, opts *pluginsdk.DialUpstreamOptions) (net.Conn, error)
 	SetResult(ctx context.Context, result map[string]any) error
+	Emit(ev pluginsdk.ConnEvent)
 }
 
 // resultConn is the slice of gatewayConn reportResponse needs: write the
@@ -230,7 +231,21 @@ func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, all
 	// error naming the credential. The token-needing step (role resolve + mint) is
 	// never reached, so no SSO work happens on this path.
 	if !hasToken {
-		return writeError(conn, req, reauthReason(credInstance))
+		reason := reauthReason(credInstance)
+
+		// Supplementary activity-stream marker (ADR 0001 D13): the Connect card is
+		// the primary expiry signal, but an audit event makes the denied request
+		// visible in the stream. It is a session condition, not a rule verdict, so
+		// it is emitted as an error event — not a fabricated allow/deny.
+		conn.Emit(pluginsdk.ConnEvent{
+			Action:  connEventError,
+			Reason:  reason,
+			Verb:    action,
+			Summary: summary,
+			Facets:  facet,
+		})
+
+		return writeError(conn, req, reason)
 	}
 
 	return forwardRequest(ctx, conn, req, body, account, host, service, region, minter, resolver)
@@ -256,6 +271,12 @@ const (
 	verdictDeny      = "deny"
 	verdictHITLDeny  = "hitl_deny"
 )
+
+// connEventError is the ConnEvent.Action for the supplementary re-auth audit
+// marker (ADR 0001 D13). The event records a session condition (an expired SSO
+// token), not a rule decision, so it uses "error" rather than a fabricated
+// allow/deny verdict no rule produced.
+const connEventError = "error"
 
 // forwardRequest runs the allowed path: auto-discover (and cache) the account's
 // role, mint short-lived SSO credentials, re-sign, and proxy upstream via the

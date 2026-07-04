@@ -114,6 +114,16 @@ type fakeConn struct {
 	result       map[string]any
 	resultErr    error // returned by SetResult to exercise the best-effort path
 	resultSample []byte
+
+	emitCalls int
+	emitEvent pluginsdk.ConnEvent
+}
+
+// Emit records the supplementary audit events the handler emits (e.g. the
+// denied-for-reauth marker, ADR 0001 D13) so tests can assert on them.
+func (c *fakeConn) Emit(ev pluginsdk.ConnEvent) {
+	c.emitCalls++
+	c.emitEvent = ev
 }
 
 func (c *fakeConn) Read(p []byte) (int, error)  { return c.incoming.Read(p) }
@@ -462,6 +472,38 @@ func TestHandleConn_ExpiredSessionSurfacesReauth(t *testing.T) {
 	is.Equal(0, resolver.calls, "expired session must not resolve a role")
 	is.Equal(0, minter.calls, "expired session must not mint credentials")
 	is.Empty(conn.dialAddr, "expired session must not dial upstream")
+}
+
+// TestHandleConn_ExpiredSessionEmitsAuditEvent proves the supplementary
+// activity-stream marker of ADR 0001 D13: the denied-for-reauth request Emits
+// exactly one ConnEvent carrying the recognizable reason and the request facet.
+// A normal (token present) request does not Emit this event — Evaluate already
+// logs the served action.
+func TestHandleConn_ExpiredSessionEmitsAuditEvent(t *testing.T) {
+	t.Parallel()
+
+	is := assert.New(t)
+	must := require.New(t)
+
+	conn := &fakeConn{
+		incoming: bytes.NewReader([]byte(rawRequest(testPlaceholderAKID))),
+		verdict:  pluginsdk.Verdict{Action: verdictAllow},
+	}
+
+	err := handleConn(context.Background(), conn, allowlist(testAccount), &fakeMinter{}, &fakeResolver{role: testRole}, testCredInstance, false)
+	must.NoError(err)
+
+	// Exactly one supplementary audit event for the denied-for-reauth request.
+	must.Equal(1, conn.emitCalls)
+	is.Contains(conn.emitEvent.Reason, "AWS SSO session expired")
+	is.Contains(conn.emitEvent.Reason, testCredInstance)
+	is.NotContains(conn.emitEvent.Reason, testSSOToken)
+	// The event carries the request facet so the activity stream shows the action.
+	is.Equal(testAccount, conn.emitEvent.Facets[fieldAccount])
+
+	// A normal request with a live token does not Emit this marker.
+	served := runAllowed(t, rawResp("200 OK", "application/json", `{"ok":true}`))
+	is.Equal(0, served.emitCalls, "a served request must not emit the reauth marker")
 }
 
 // runAllowed drives the allow path against a canned raw upstream response and
