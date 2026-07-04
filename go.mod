@@ -4,11 +4,14 @@ go 1.26.4
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.41.7
+	github.com/aws/aws-sdk-go-v2/service/sso v1.30.17
 	github.com/denoland/clawpatrol v0.5.3
 	github.com/stretchr/testify v1.7.2
 )
 
 require (
+	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.23 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.23 // indirect
 	github.com/aws/smithy-go v1.25.1 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/fatih/color v1.18.0 // indirect
