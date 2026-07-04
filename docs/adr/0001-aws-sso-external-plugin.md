@@ -59,32 +59,31 @@ as a second credential, not a per-request switch.
 ```hcl
 credential "aws_sso" "wp" {
   start_url = "https://<org>.awsapps.com/start"
-  region    = "eu-central-1"              # SSO / Identity Center region
-  endpoints = [aws_api.aws, aws_api.s3]   # one session, many endpoints
-
-  account { id = "111111111111" }                                 # role auto-discovered, placeholder derived
-  account { id = "222222222222", role_name = "AgentReadOnly" }    # role pinned (guard)
-  account { id = "333333333333", placeholder = "AKIA…CUSTOM" }    # explicit AKID override
+  region    = "eu-central-1"                     # SSO / Identity Center region
+  endpoints = [aws_api.aws, aws_api.s3]          # one session, many endpoints
+  accounts  = ["111111111111", "222222222222"]   # the explicit allowlist (account ids)
 }
 ```
 
-- `id` — **required**, 12-digit account number.
-- `role_name` — **optional**. Omitted ⇒ auto-discover via `sso:ListAccountRoles`;
-  the account **must** resolve to a single role (else config/request error). An
-  explicit `role_name` also acts as a **guard**: it pins exactly which permission
-  set the bot may assume, so an operator's broader SSO entitlements can't leak to
-  the bot by accident.
-- `placeholder` — **optional**. Omitted ⇒ derived from the account id (see D5).
-- Validation: each account appears **at most once** (account is the dispatch key,
-  so duplicates are ambiguous); placeholders (derived or explicit) must be unique.
+- `accounts` — **required**, a flat `list(string)` of 12-digit account numbers:
+  the explicit allowlist. Each id appears at most once.
+- **Role** is not configured per account in this cut — it is **auto-discovered**
+  via `sso:ListAccountRoles` and must resolve to a **single** role per account
+  (else a clear error).
+- **Placeholder** is always **derived** from the account id (see D5); dispatch
+  placeholders are unique by construction.
 
-> **Revisit later:** we may want to allow the *same* account with **multiple
-> roles** in one credential, selected per request by distinct placeholders. That
-> would make the uniqueness key the `(account, role_name)` pair (not the account),
-> keep unique placeholders as the dispatch key, shift dispatch from account-decode
-> (D5) to **placeholder-match**, require explicit `placeholder`s (the derived form
-> collides on a shared account), and relax D2 (role would then vary per request via
-> the agent's chosen profile). Deferred — **single role per account for now**.
+> **Flat-schema constraint (discovered building Slice 1):** pluginsdk (v0.5.3,
+> `ctyTypeFromString`) accepts only **flat attributes** — primitive or
+> `list(primitive)` — with **no nested/repeated blocks**. So the earlier
+> `account { id, role_name, placeholder }` block isn't expressible; the allowlist is
+> a flat `accounts = list(string)`. Two things are deferred with it: the per-account
+> `role_name` **guard** and the explicit `placeholder` **override**. If we later need
+> them, the flat path is **option B** — encode per entry (e.g. `"<id>:<role>"`) and
+> parse in the plugin (or add a credential-level uniform `role_name`). Multiple roles
+> for the *same* account would then work via distinct (encoded) placeholders,
+> shifting dispatch to placeholder-match and relaxing D2. For now: **one
+> auto-discovered role per account, derived placeholders, account-id allowlist.**
 
 ### D4 — The account allowlist is explicit and required; the boundary is never auto-discovered
 
@@ -114,7 +113,8 @@ account from the SigV4 access-key-id the agent signed with:
 - The agent's `~/.aws/credentials` profiles are therefore **mechanically
   derivable** from the account list — no coordination table between the gateway
   config and the agent file. A seed script can generate them directly.
-- An explicit `placeholder` remains an optional override for custom AKIDs.
+- An explicit placeholder override is **not** expressible under the flat schema
+  (D3); placeholders are always derived in this cut (custom AKIDs → option B).
 - An AKID whose decoded account is **not on the allowlist** is denied.
 
 ### D6 — Topology: state on the credential, `hosts` on the endpoint
