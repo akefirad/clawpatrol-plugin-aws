@@ -65,5 +65,6 @@ func SignRequest(
 	if err := signer.SignHTTP(ctx, creds, out, payloadHash, service, region, time.Now().UTC()); err != nil {
 		return nil, fmt.Errorf("sigv4 sign %s/%s: %w", service, region, err)
 	}
+
 	return out, nil
 }

@@ -24,13 +24,16 @@ func ParseServiceRegion(host string) (service, region string) {
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
+
 	host = strings.TrimSuffix(strings.TrimSuffix(host, "."), ".amazonaws.com")
 
 	labels := strings.Split(host, ".")
 	service = labels[0]
+
 	region = defaultRegion
 	if len(labels) >= 2 && labels[1] != "" {
 		region = labels[1]
 	}
+
 	return service, region
 }

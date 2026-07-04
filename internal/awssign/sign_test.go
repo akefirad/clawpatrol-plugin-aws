@@ -19,8 +19,8 @@ import (
 // pass tautologically.
 const (
 	emptyBodySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-	jsonBodySHA256  = "2773842e9fb86ebb13ff1a59ce073407a3b41dd190d39cd9ce585a2cd8941996"
-	jsonBody        = `{"Action":"GetCallerIdentity","Version":"2011-06-15"}`
+	stsBodySHA256   = "2773842e9fb86ebb13ff1a59ce073407a3b41dd190d39cd9ce585a2cd8941996"
+	stsBody         = `{"Action":"GetCallerIdentity","Version":"2011-06-15"}`
 )
 
 // placeholder is the identity the agent signs with (ADR 0001 D5): AKIA +
@@ -34,19 +34,24 @@ const (
 // placeholder-signed, with an X-Amz-Security-Token the re-sign must replace.
 func incomingRequest(t *testing.T, host, body string) *http.Request {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "https://"+host+"/", strings.NewReader(body))
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "https://"+host+"/", strings.NewReader(body))
 	req.Header.Set("Authorization",
 		"AWS4-HMAC-SHA256 Credential="+placeholderAKID+
 			"/20200101/us-east-1/sts/aws4_request, SignedHeaders=host;x-amz-date, Signature=deadbeef")
 	req.Header.Set("X-Amz-Security-Token", placeholderToken)
+
 	return req
 }
 
 func TestSignRequest_ReplacesPlaceholderWithSeededIdentity(t *testing.T) {
+	t.Parallel()
+
 	is := assert.New(t)
 	must := require.New(t)
 
 	const host = "sts.us-east-1.amazonaws.com"
+
 	service, region := awssign.ParseServiceRegion(host) // service/region come from the host
 	must.Equal("sts", service)
 	must.Equal("us-east-1", region)
@@ -57,8 +62,8 @@ func TestSignRequest_ReplacesPlaceholderWithSeededIdentity(t *testing.T) {
 		SessionToken:    "SEEDED-SESSION-TOKEN",
 	}
 
-	body := []byte(jsonBody)
-	out, err := awssign.SignRequest(context.Background(), incomingRequest(t, host, jsonBody), host, body, service, region, seeded)
+	body := []byte(stsBody)
+	out, err := awssign.SignRequest(context.Background(), incomingRequest(t, host, stsBody), host, body, service, region, seeded)
 	must.NoError(err)
 	must.NotNil(out)
 
@@ -74,7 +79,7 @@ func TestSignRequest_ReplacesPlaceholderWithSeededIdentity(t *testing.T) {
 	is.Equal("SEEDED-SESSION-TOKEN", out.Header.Get("X-Amz-Security-Token"))
 
 	// The payload hash header matches the body (independently known hash).
-	is.Equal(jsonBodySHA256, out.Header.Get("X-Amz-Content-Sha256"))
+	is.Equal(stsBodySHA256, out.Header.Get("X-Amz-Content-Sha256"))
 
 	// Upstream request targets the AWS host, not the agent's placeholder URL.
 	is.Equal(host, out.Host)
@@ -82,10 +87,13 @@ func TestSignRequest_ReplacesPlaceholderWithSeededIdentity(t *testing.T) {
 }
 
 func TestSignRequest_EmptyBodyAndNoSessionToken(t *testing.T) {
+	t.Parallel()
+
 	is := assert.New(t)
 	must := require.New(t)
 
 	const host = "iam.amazonaws.com" // global service
+
 	service, region := awssign.ParseServiceRegion(host)
 	must.Equal("iam", service)
 	must.Equal("us-east-1", region) // global services sign as us-east-1 (D7)

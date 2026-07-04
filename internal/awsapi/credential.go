@@ -1,6 +1,10 @@
+// Package awsapi implements the AWS SSO plugin's building blocks: the aws_sso
+// credential (Connect-card wiring, no login code), the aws_api endpoint (SigV4
+// re-sign + brokered proxy), and the minimal aws facet.
 package awsapi
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/denoland/clawpatrol/pluginsdk"
@@ -52,14 +56,17 @@ func buildCredential(req pluginsdk.BuildRequest) (any, error) {
 	if err := req.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("decode aws_sso config: %w", err)
 	}
+
 	if cfg.StartURL == "" {
-		return nil, fmt.Errorf("aws_sso: start_url is required")
+		return nil, errors.New("aws_sso: start_url is required")
 	}
+
 	if cfg.Region == "" {
-		return nil, fmt.Errorf("aws_sso: region is required")
+		return nil, errors.New("aws_sso: region is required")
 	}
+
 	if cfg.AccountID == "" {
-		return nil, fmt.Errorf("aws_sso: account_id is required")
+		return nil, errors.New("aws_sso: account_id is required")
 	}
 
 	return pluginsdk.CredentialBuildResult{

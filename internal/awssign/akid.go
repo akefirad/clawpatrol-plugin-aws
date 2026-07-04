@@ -10,14 +10,17 @@ import "strings"
 // Returns false when the header carries no Credential= element.
 func CredentialAKID(authorization string) (string, bool) {
 	const key = "Credential="
-	i := strings.Index(authorization, key)
-	if i < 0 {
+
+	_, after, ok := strings.Cut(authorization, key)
+	if !ok {
 		return "", false
 	}
-	rest := authorization[i+len(key):]
-	if j := strings.IndexByte(rest, '/'); j >= 0 {
-		return rest[:j], true
+
+	rest := after
+	if before, _, ok := strings.Cut(rest, "/"); ok {
+		return before, true
 	}
+
 	return "", false
 }
 
@@ -27,16 +30,20 @@ func CredentialAKID(authorization string) (string, bool) {
 // to "123456789012". Returns false when no 12-digit run is present.
 func AccountFromAKID(akid string) (string, bool) {
 	run := make([]byte, 0, 12)
-	for i := 0; i < len(akid); i++ {
+
+	for i := range len(akid) {
 		c := akid[i]
 		if c >= '0' && c <= '9' {
 			run = append(run, c)
 			if len(run) == 12 {
 				return string(run), true
 			}
+
 			continue
 		}
+
 		run = run[:0]
 	}
+
 	return "", false
 }
