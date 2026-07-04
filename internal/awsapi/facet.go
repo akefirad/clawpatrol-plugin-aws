@@ -24,8 +24,12 @@ const (
 // so it is the facet's Title (the activity log shows it instead of the HTTP
 // method). iam_action is the permission-shaped action, best-effort: it is
 // Optional and omitted (not "") when undeterminable, so an allow rule matching
-// on it fails closed rather than matching a guess (D8). account_name and the
-// response taps stay deferred to later slices.
+// on it fails closed rather than matching a guess (D8).
+//
+// ResultFields are reported after the upstream response via Conn.SetResult:
+// status (the HTTP code, or the AWS error code on a 4xx/5xx) is the result
+// Title; response_body is a bounded body sample (a FacetStream the gateway
+// caps). account_name (Organizations) stays deferred to a later slice.
 func Facet() pluginsdk.FacetDef {
 	return pluginsdk.FacetDef{
 		Name: FacetName,
@@ -37,6 +41,10 @@ func Facet() pluginsdk.FacetDef {
 			{Name: fieldRegion, Kind: pluginsdk.FacetString, Label: "Region", Description: "Signing region (from the request host)"},
 			{Name: fieldResource, Kind: pluginsdk.FacetString, Label: "Resource", Description: "Request path"},
 			{Name: fieldMethod, Kind: pluginsdk.FacetString, Label: "Method", Description: "HTTP method"},
+		},
+		ResultFields: []pluginsdk.FacetField{
+			{Name: resultFieldStatus, Kind: pluginsdk.FacetString, Label: "Status", Description: "HTTP status code, or AWS error code on a 4xx/5xx", Title: true},
+			{Name: resultFieldResponseBody, Kind: pluginsdk.FacetStream, Label: "Response body", Description: "Bounded sample of the upstream response body"},
 		},
 	}
 }
