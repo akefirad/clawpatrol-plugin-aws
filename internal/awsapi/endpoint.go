@@ -38,6 +38,14 @@ type gatewayConn interface {
 	io.Writer
 	Evaluate(ctx context.Context, facet string, action map[string]any, summary string) (pluginsdk.Verdict, error)
 	DialUpstream(ctx context.Context, network, addr string, opts *pluginsdk.DialUpstreamOptions) (net.Conn, error)
+	SetResult(ctx context.Context, result map[string]any) error
+}
+
+// resultConn is the slice of gatewayConn reportResponse needs: write the
+// response back to the agent and report its outcome via SetResult.
+type resultConn interface {
+	io.Writer
+	SetResult(ctx context.Context, result map[string]any) error
 }
 
 // Endpoint declares the aws_api endpoint. It carries only `hosts` (injected by
@@ -199,21 +207,30 @@ func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, all
 		return fmt.Errorf("evaluate %s: %w", summary, err)
 	}
 
+	// Synchronous HITL (ADR 0001 request flow): Evaluate walks the approve chain
+	// and blocks until the decision, so by here the verdict is final. allow and
+	// hitl_allow proceed identically — the mint happens below, after the verdict,
+	// so a request approved after a delay is signed with fresh credentials.
+	// deny/hitl_deny block with no SSO work; any unknown action fails closed.
 	switch verdict.Action {
 	case verdictAllow, verdictHITLAllow:
 		// proceed
 	default:
+		// deny, hitl_deny, error, or any unrecognized action: fail closed.
 		return writeError(conn, req, "aws_api: "+verdict.Reason)
 	}
 
 	return forwardRequest(ctx, conn, req, body, account, host, service, region, minter, resolver)
 }
 
-// Verdict actions the gateway returns that permit the request to proceed; any
-// other action denies it.
+// Verdict actions the gateway returns (pluginsdk.Verdict.Action). allow and
+// hitl_allow permit the request to proceed; deny and hitl_deny block it, as
+// does any unrecognized action (fail closed).
 const (
 	verdictAllow     = "allow"
 	verdictHITLAllow = "hitl_allow"
+	verdictDeny      = "deny"
+	verdictHITLDeny  = "hitl_deny"
 )
 
 // forwardRequest runs the allowed path: auto-discover (and cache) the account's
@@ -257,7 +274,9 @@ func forwardRequest(ctx context.Context, conn gatewayConn, req *http.Request, bo
 
 	defer func() { _ = resp.Body.Close() }()
 
-	if err := resp.Write(conn); err != nil {
+	// Write the response to the agent and report its outcome (status + a bounded
+	// body sample) to the gateway via SetResult (ADR 0001 D8 result fields).
+	if err := reportResponse(ctx, conn, resp); err != nil {
 		return fmt.Errorf("write response to agent: %w", err)
 	}
 
