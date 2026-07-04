@@ -30,18 +30,21 @@ type Roles struct {
 type RolesOption func(*Roles)
 
 // WithRolesClientFunc overrides the sso-client seam — the way a resolver builds
-// its SSO client. Production leaves it defaulted to newSSOClient; tests pass a
-// factory pointed at a mock server.
+// its SSO client. Production leaves it defaulted to the brokered client; tests
+// pass a factory pointed at a mock server.
 func WithRolesClientFunc(fn ssoClientFunc) RolesOption {
 	return func(r *Roles) { r.newClient = fn }
 }
 
-// NewRoles builds a role resolver for the SSO region and access token.
-func NewRoles(region, token string, opts ...RolesOption) *Roles {
+// NewRoles builds a role resolver for the SSO region and access token. dial is
+// the gateway's brokered dial (pluginsdk.Conn.DialUpstream): the SSO client
+// routes every sso:ListAccountRoles call through it, since the plugin has no
+// network of its own (ADR 0001 Capabilities).
+func NewRoles(region, token string, dial DialFunc, opts ...RolesOption) *Roles {
 	r := &Roles{
 		region:    region,
 		token:     token,
-		newClient: newSSOClient,
+		newClient: func(rg string) *sso.Client { return newSSOClient(rg, dial) },
 		cache:     make(map[string]string),
 	}
 

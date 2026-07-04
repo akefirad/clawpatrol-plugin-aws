@@ -212,7 +212,7 @@ func newMockSSOServer(t *testing.T) *mockSSOServer {
 }
 
 func (m *mockSSOServer) minter() *awssso.Minter {
-	return awssso.New(testSSORegion, testSSOToken, time.Minute, awssso.WithClientFunc(func(region string) *sso.Client {
+	return awssso.New(testSSORegion, testSSOToken, time.Minute, nil, awssso.WithClientFunc(func(region string) *sso.Client {
 		return sso.New(sso.Options{
 			Region:       region,
 			BaseEndpoint: aws.String(m.server.URL),

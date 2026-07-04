@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"time"
@@ -68,14 +69,29 @@ func Endpoint() pluginsdk.EndpointDef {
 				allow[id] = struct{}{}
 			}
 
-			minter := awssso.New(region, token, credentialExpiryWindow)
-			resolver := awssso.NewRoles(region, token)
+			// The plugin runs Network=none (ADR 0001 Capabilities): the SSO
+			// client's GetRoleCredentials/ListAccountRoles calls must reach
+			// portal.sso.<region>.amazonaws.com through the gateway's brokered
+			// dial, exactly like the final request dial below — never the SDK's
+			// default (direct) transport.
+			minter := awssso.New(region, token, credentialExpiryWindow, conn.DialUpstream)
+			resolver := awssso.NewRoles(region, token, conn.DialUpstream)
 
 			// An empty token is an expired SSO session with no valid refresh (ADR
 			// 0001 D13): the gateway delivers no CredentialSecret. Thread the
 			// credential instance name so a would-be-served request can surface a
 			// recognizable re-auth error instead of failing at mint.
-			return handleConn(ctx, conn, allow, minter, resolver, conn.CredentialInstance, token != "")
+			err = handleConn(ctx, conn, allow, minter, resolver, conn.CredentialInstance, token != "")
+			if err != nil {
+				// The gateway closes the conn on a HandleConn error with no
+				// response to the agent, so without this the failure is silent
+				// (GH-16). go-plugin surfaces plugin stderr in the gateway log.
+				// The wrapped error carries request context (account, host) but
+				// never a token or minted secret.
+				log.Printf("aws_api: connection for credential %q failed: %v", conn.CredentialInstance, err)
+			}
+
+			return err
 		},
 	}
 }
@@ -248,7 +264,13 @@ func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, all
 		return writeError(conn, req, reason)
 	}
 
-	return forwardRequest(ctx, conn, req, body, account, host, service, region, minter, resolver)
+	if err := forwardRequest(ctx, conn, req, body, account, host, service, region, minter, resolver); err != nil {
+		// Tag the error with the account and host so the HandleConn log names the
+		// failing request (the underlying wraps already carry the SSO/dial detail).
+		return fmt.Errorf("forward request for account %s to %s: %w", account, host, err)
+	}
+
+	return nil
 }
 
 // reauthReason is the recognizable re-auth error surfaced to the agent when the
