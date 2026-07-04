@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -107,10 +108,29 @@ type fakeConn struct {
 
 	dialAddr string
 	upstream *fakeUpstream
+
+	resultCalls  int
+	result       map[string]any
+	resultErr    error // returned by SetResult to exercise the best-effort path
+	resultSample []byte
 }
 
 func (c *fakeConn) Read(p []byte) (int, error)  { return c.incoming.Read(p) }
 func (c *fakeConn) Write(p []byte) (int, error) { return c.toAgent.Write(p) }
+
+// SetResult records the reported outcome. When the result carries a
+// response_body stream it drains it (as the gateway would) into resultSample so
+// tests can assert the teed sample.
+func (c *fakeConn) SetResult(_ context.Context, result map[string]any) error {
+	c.resultCalls++
+	c.result = result
+
+	if sv, ok := result[resultFieldResponseBody].(pluginsdk.StreamValue); ok {
+		c.resultSample, _ = io.ReadAll(sv.R)
+	}
+
+	return c.resultErr
+}
 
 func (c *fakeConn) Evaluate(_ context.Context, facet string, action map[string]any, summary string) (pluginsdk.Verdict, error) {
 	c.evalCalls++
@@ -337,6 +357,206 @@ func TestHandleConn_S3PutObjectChunkedReSigns(t *testing.T) {
 	is.Equal(mintedToken, out.Header.Get("X-Amz-Security-Token"))
 }
 
+// TestHandleConn_HITLAllowProceeds proves the synchronous HITL path: a
+// hitl_allow verdict (the gateway held the connection through the approve chain
+// and a human approved) proceeds exactly like a plain allow — role resolved,
+// credentials minted fresh after the verdict (ADR 0001 request flow), re-signed,
+// and dialed upstream.
+func TestHandleConn_HITLAllowProceeds(t *testing.T) {
+	t.Parallel()
+
+	is := assert.New(t)
+	must := require.New(t)
+
+	mock := newMockSSOServer(t)
+	upstream := &fakeUpstream{
+		response: bytes.NewReader([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")),
+	}
+	conn := &fakeConn{
+		incoming: bytes.NewReader([]byte(rawRequest(testPlaceholderAKID))),
+		verdict:  pluginsdk.Verdict{Action: verdictHITLAllow},
+		upstream: upstream,
+	}
+	resolver := &fakeResolver{role: testRole}
+
+	err := handleConn(context.Background(), conn, allowlist(testAccount), mock.minter(), resolver)
+	must.NoError(err)
+
+	// The approved request resolved its role, minted fresh, and dialed upstream.
+	is.Equal(1, resolver.calls, "hitl_allow must resolve the role")
+	is.Equal(testHost+":443", conn.dialAddr, "hitl_allow must dial upstream")
+
+	// Minted after the verdict, with the SSO token delivered as CredentialSecret.
+	is.Equal(testSSOToken, mock.seenAuth)
+
+	// The outbound request carries the minted identity, not the placeholder.
+	out, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(upstream.written.Bytes())))
+	must.NoError(err)
+	is.Contains(out.Header.Get("Authorization"), "Credential="+mintedAKID+"/")
+	is.Equal(mintedToken, out.Header.Get("X-Amz-Security-Token"))
+}
+
+// TestHandleConn_DenyVerdictsBlock proves deny and hitl_deny both block with no
+// SSO work: no role resolution, no mint, no upstream dial, and a 403 to the
+// agent (ADR 0001: mint happens only after an allowing verdict).
+func TestHandleConn_DenyVerdictsBlock(t *testing.T) {
+	t.Parallel()
+
+	for _, action := range []string{verdictDeny, verdictHITLDeny} {
+		t.Run(action, func(t *testing.T) {
+			t.Parallel()
+
+			conn := &fakeConn{
+				incoming: bytes.NewReader([]byte(rawRequest(testPlaceholderAKID))),
+				verdict:  pluginsdk.Verdict{Action: action, Reason: "policy: " + action},
+			}
+			minter := &fakeMinter{}
+			resolver := &fakeResolver{role: testRole}
+
+			err := handleConn(context.Background(), conn, allowlist(testAccount), minter, resolver)
+			require.NoError(t, err)
+
+			// The account is on the allowlist, so it was evaluated — but the
+			// verdict blocked it before any SSO work.
+			assert.Equal(t, 1, conn.evalCalls, "a blocked request is still evaluated")
+			denied(t, conn, minter, resolver)
+		})
+	}
+}
+
+// runAllowed drives the allow path against a canned raw upstream response and
+// returns the fakeConn so the caller can assert what reached the agent and what
+// was reported via SetResult.
+func runAllowed(t *testing.T, rawResponse string) *fakeConn {
+	t.Helper()
+
+	mock := newMockSSOServer(t)
+	conn := &fakeConn{
+		incoming: bytes.NewReader([]byte(rawRequest(testPlaceholderAKID))),
+		verdict:  pluginsdk.Verdict{Action: verdictAllow},
+		upstream: &fakeUpstream{response: bytes.NewReader([]byte(rawResponse))},
+	}
+
+	err := handleConn(context.Background(), conn, allowlist(testAccount), mock.minter(), &fakeResolver{role: testRole})
+	require.NoError(t, err)
+
+	return conn
+}
+
+// rawResp frames a raw HTTP/1.1 response with a correct Content-Length for a
+// fakeUpstream to serve.
+func rawResp(statusLine, contentType, body string) string {
+	return fmt.Sprintf(
+		"HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n%s",
+		statusLine, contentType, len(body), body,
+	)
+}
+
+// agentResponse parses the response the handler wrote back to the agent and
+// returns its status code and fully-read body.
+func agentResponse(t *testing.T, conn *fakeConn) (status int, body []byte) {
+	t.Helper()
+
+	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(conn.toAgent.Bytes())), nil)
+	require.NoError(t, err)
+
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	return resp.StatusCode, body
+}
+
+func TestReportResponse_SuccessStatusAndBodySample(t *testing.T) {
+	t.Parallel()
+
+	is := assert.New(t)
+
+	const payload = `{"ok":true}`
+
+	conn := runAllowed(t, rawResp("200 OK", "application/json", payload))
+
+	// The agent received the complete, unmodified response.
+	status, body := agentResponse(t, conn)
+	is.Equal(http.StatusOK, status)
+	is.Equal(payload, string(body))
+
+	// SetResult reported the numeric status and a matching body sample.
+	is.Equal(1, conn.resultCalls)
+	is.Equal("200", conn.result[resultFieldStatus])
+	is.Equal(payload, string(conn.resultSample))
+}
+
+func TestReportResponse_ErrorSurfacesAWSCode(t *testing.T) {
+	t.Parallel()
+
+	is := assert.New(t)
+
+	// An S3-style XML error: the agent must still get the whole body, and the
+	// reported status must be the AWS error code, not "403".
+	const errBody = `<?xml version="1.0" encoding="UTF-8"?><Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>`
+
+	conn := runAllowed(t, rawResp("403 Forbidden", "application/xml", errBody))
+
+	status, body := agentResponse(t, conn)
+	is.Equal(http.StatusForbidden, status)
+	is.Equal(errBody, string(body), "the agent must receive the complete, unmodified error body")
+
+	is.Equal(1, conn.resultCalls)
+	is.Equal("AccessDenied", conn.result[resultFieldStatus])
+}
+
+func TestReportResponse_LargeBodyNotCorruptedAndSampleBounded(t *testing.T) {
+	t.Parallel()
+
+	is := assert.New(t)
+	must := require.New(t)
+
+	// A body larger than both the error-peek cap and the sample cap: the agent's
+	// copy must be complete (the tee must not short or corrupt it), while the
+	// reported sample is bounded.
+	payload := bytes.Repeat([]byte("abcdefgh"), 8192) // 64 KiB
+
+	conn := runAllowed(t, rawResp("200 OK", "application/octet-stream", string(payload)))
+
+	status, body := agentResponse(t, conn)
+	is.Equal(http.StatusOK, status)
+	must.Len(body, len(payload), "the agent must receive the whole body")
+	is.Equal(payload, body)
+
+	is.Equal(1, conn.resultCalls)
+	is.Equal("200", conn.result[resultFieldStatus])
+	is.Len(conn.resultSample, responseSampleCap, "the sample is bounded to the cap")
+	is.Equal(payload[:responseSampleCap], conn.resultSample, "the sample is a clean prefix")
+}
+
+func TestReportResponse_SetResultFailureIsBestEffort(t *testing.T) {
+	t.Parallel()
+
+	is := assert.New(t)
+	must := require.New(t)
+
+	const payload = "ok"
+
+	mock := newMockSSOServer(t)
+	conn := &fakeConn{
+		incoming:  bytes.NewReader([]byte(rawRequest(testPlaceholderAKID))),
+		verdict:   pluginsdk.Verdict{Action: verdictAllow},
+		upstream:  &fakeUpstream{response: bytes.NewReader([]byte(rawResp("200 OK", "text/plain", payload)))},
+		resultErr: errors.New("gateway result store unavailable"),
+	}
+
+	// A SetResult failure must not fail the request — the agent already has its
+	// response.
+	err := handleConn(context.Background(), conn, allowlist(testAccount), mock.minter(), &fakeResolver{role: testRole})
+	must.NoError(err)
+
+	_, body := agentResponse(t, conn)
+	is.Equal(payload, string(body))
+	is.Equal(1, conn.resultCalls)
+}
+
 // denied asserts a fail-closed outcome: a 403 to the agent, and no role
 // resolution, no mint, and no upstream dial.
 func denied(t *testing.T, conn *fakeConn, minter *fakeMinter, resolver *fakeResolver) {
@@ -388,6 +608,69 @@ func TestHandleConn_NoAKIDDenied(t *testing.T) {
 	require.NoError(t, err)
 
 	denied(t, conn, minter, resolver)
+}
+
+// rawReq builds a minimal SigV4-signed request (placeholder AKID) for an
+// arbitrary method/host/path, used to exercise the facet the example rules
+// match on across representative read/write operations.
+func rawReq(method, host, path string) string {
+	return fmt.Sprintf(
+		"%s %s HTTP/1.1\r\n"+
+			"Host: %s\r\n"+
+			"Authorization: AWS4-HMAC-SHA256 Credential=%s/20200101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=deadbeef\r\n"+
+			"Content-Length: 0\r\n"+
+			"\r\n",
+		method, path, host, testPlaceholderAKID,
+	)
+}
+
+// TestFacetCoverage_ExampleRuleFields proves the plugin populates the aws facet
+// fields the shipped examples/gateway.hcl rules reference — so those rules can
+// match. It asserts the always-present anchors write gates use (method, action,
+// service, account) and the best-effort iam_action reads allow on, across
+// representative S3 read and write operations. A deny verdict lets the facet be
+// captured without any mint.
+func TestFacetCoverage_ExampleRuleFields(t *testing.T) {
+	t.Parallel()
+
+	const s3Host = "s3.us-east-1.amazonaws.com"
+
+	tests := []struct {
+		name, method, path string
+		action, iamAction  string
+	}{
+		{"read object", http.MethodGet, "/bucket/key.txt", "GetObject", "s3:GetObject"},
+		{"list bucket", http.MethodGet, "/bucket", "ListObjects", "s3:ListBucket"},
+		{"write object", http.MethodPut, "/bucket/key.txt", "PutObject", "s3:PutObject"},
+		{"delete object", http.MethodDelete, "/bucket/key.txt", "DeleteObject", "s3:DeleteObject"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			is := assert.New(t)
+			must := require.New(t)
+
+			conn := &fakeConn{
+				incoming: bytes.NewReader([]byte(rawReq(tc.method, s3Host, tc.path))),
+				verdict:  pluginsdk.Verdict{Action: verdictDeny}, // deny: capture the facet, no mint
+			}
+
+			err := handleConn(context.Background(), conn, allowlist(testAccount), &fakeMinter{}, &fakeResolver{role: testRole})
+			must.NoError(err)
+			must.NotNil(conn.evalAction)
+
+			// Always-present anchors the example write gates key on.
+			is.Equal(tc.method, conn.evalAction[fieldMethod])
+			is.Equal(tc.action, conn.evalAction[fieldAction])
+			is.Equal("s3", conn.evalAction[fieldService])
+			is.Equal(testAccount, conn.evalAction[fieldAccount])
+
+			// Best-effort iam_action the example reads-allow rule matches on.
+			is.Equal(tc.iamAction, conn.evalAction[fieldIAMAction])
+		})
+	}
 }
 
 func TestEndpointParams_ReadsAllowlistAndTokenFromSecret(t *testing.T) {
