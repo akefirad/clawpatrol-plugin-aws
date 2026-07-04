@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -200,7 +202,7 @@ func TestHandleConn_AllowedAccountMintsAndReSigns(t *testing.T) {
 	}
 	conn := &fakeConn{
 		incoming: bytes.NewReader([]byte(rawRequest(testPlaceholderAKID))),
-		verdict:  pluginsdk.Verdict{Action: "allow"},
+		verdict:  pluginsdk.Verdict{Action: verdictAllow},
 		upstream: upstream,
 	}
 	resolver := &fakeResolver{role: testRole}
@@ -219,6 +221,11 @@ func TestHandleConn_AllowedAccountMintsAndReSigns(t *testing.T) {
 	is.Equal("us-east-1", conn.evalAction["region"])
 	is.Equal(http.MethodPost, conn.evalAction["method"])
 	is.Equal("/", conn.evalAction["resource"])
+
+	// The verb is unknowable for this JSON-1.0 body (no X-Amz-Target, no Action
+	// param), so action falls back to "METHOD path" and iam_action is omitted.
+	is.Equal("POST /", conn.evalAction["action"])
+	is.NotContains(conn.evalAction, "iam_action")
 
 	// Brokered dial targeted the AWS host.
 	is.Equal(testHost+":443", conn.dialAddr)
@@ -239,6 +246,95 @@ func TestHandleConn_AllowedAccountMintsAndReSigns(t *testing.T) {
 	body, err := io.ReadAll(out.Body)
 	must.NoError(err)
 	is.JSONEq(testBody, string(body))
+}
+
+// awsChunkedBody frames payload as a single aws-chunked data chunk followed by
+// the terminating zero chunk — the wire shape an S3 streaming upload sends.
+func awsChunkedBody(payload []byte) string {
+	const sig = ";chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n"
+
+	return fmt.Sprintf("%x", len(payload)) + sig + string(payload) + "\r\n" + "0" + sig + "\r\n"
+}
+
+// rawChunkedPut builds an S3 PutObject request sent aws-chunked with
+// Expect: 100-continue — the shape that fails SignatureDoesNotMatch unless the
+// gateway decodes the body and drops the chunk-framing headers before
+// re-signing.
+func rawChunkedPut(host, akid string, payload []byte) string {
+	framed := awsChunkedBody(payload)
+
+	return fmt.Sprintf(
+		"PUT /bucket/key.txt HTTP/1.1\r\n"+
+			"Host: %s\r\n"+
+			"Authorization: AWS4-HMAC-SHA256 Credential=%s/20200101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=deadbeef\r\n"+
+			"X-Amz-Security-Token: PLACEHOLDER-TOKEN\r\n"+
+			"Content-Encoding: aws-chunked\r\n"+
+			"X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD\r\n"+
+			"X-Amz-Decoded-Content-Length: %d\r\n"+
+			"X-Amz-Checksum-Crc32c: aXQ9Cw==\r\n"+
+			"Expect: 100-continue\r\n"+
+			"Content-Length: %d\r\n"+
+			"\r\n%s",
+		host, akid, len(payload), len(framed), framed,
+	)
+}
+
+func TestHandleConn_S3PutObjectChunkedReSigns(t *testing.T) {
+	t.Parallel()
+
+	is := assert.New(t)
+	must := require.New(t)
+
+	const s3Host = "s3.us-east-1.amazonaws.com"
+
+	payload := []byte("the-object-bytes-payload")
+
+	mock := newMockSSOServer(t)
+	upstream := &fakeUpstream{
+		response: bytes.NewReader([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")),
+	}
+	conn := &fakeConn{
+		incoming: bytes.NewReader([]byte(rawChunkedPut(s3Host, testPlaceholderAKID, payload))),
+		verdict:  pluginsdk.Verdict{Action: verdictAllow},
+		upstream: upstream,
+	}
+	resolver := &fakeResolver{role: testRole}
+
+	err := handleConn(context.Background(), conn, allowlist(testAccount), mock.minter(), resolver)
+	must.NoError(err)
+
+	// The enriched facet reached Evaluate with the reconstructed S3 op.
+	must.NotNil(conn.evalAction)
+	is.Equal("s3", conn.evalAction["service"])
+	is.Equal("PutObject", conn.evalAction["action"])
+	is.Equal("s3:PutObject", conn.evalAction["iam_action"])
+	is.Equal(http.MethodPut, conn.evalAction["method"])
+	is.Equal("/bucket/key.txt", conn.evalAction["resource"])
+
+	// Expect: 100-continue was acknowledged so the agent streamed the body.
+	is.Contains(conn.toAgent.String(), "100 Continue")
+
+	// The outbound request carries the decoded raw payload, not the framing.
+	out, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(upstream.written.Bytes())))
+	must.NoError(err)
+
+	body, err := io.ReadAll(out.Body)
+	must.NoError(err)
+	is.Equal(payload, body)
+	is.Equal(int64(len(payload)), out.ContentLength)
+
+	// The chunk-framing / checksum headers the re-sign can't reproduce are gone,
+	// and X-Amz-Content-Sha256 is the hash of the raw payload (not STREAMING-*).
+	is.Empty(out.Header.Get("Content-Encoding"))
+	is.Empty(out.Header.Get("X-Amz-Decoded-Content-Length"))
+	is.Empty(out.Header.Get("X-Amz-Checksum-Crc32c"))
+
+	sum := sha256.Sum256(payload)
+	is.Equal(hex.EncodeToString(sum[:]), out.Header.Get("X-Amz-Content-Sha256"))
+
+	// Signed with the minted identity.
+	is.Contains(out.Header.Get("Authorization"), "Credential="+mintedAKID+"/")
+	is.Equal(mintedToken, out.Header.Get("X-Amz-Security-Token"))
 }
 
 // denied asserts a fail-closed outcome: a 403 to the agent, and no role
@@ -266,7 +362,7 @@ func TestHandleConn_UnknownAccountDenied(t *testing.T) {
 
 	conn := &fakeConn{
 		incoming: bytes.NewReader([]byte(rawRequest(testPlaceholderAKID))),
-		verdict:  pluginsdk.Verdict{Action: "allow"}, // even an allow verdict must not save it
+		verdict:  pluginsdk.Verdict{Action: verdictAllow}, // even an allow verdict must not save it
 	}
 	minter := &fakeMinter{}
 	resolver := &fakeResolver{role: testRole}
@@ -283,7 +379,7 @@ func TestHandleConn_NoAKIDDenied(t *testing.T) {
 
 	conn := &fakeConn{
 		incoming: bytes.NewReader([]byte(rawRequestNoAuth())),
-		verdict:  pluginsdk.Verdict{Action: "allow"},
+		verdict:  pluginsdk.Verdict{Action: verdictAllow},
 	}
 	minter := &fakeMinter{}
 	resolver := &fakeResolver{role: testRole}

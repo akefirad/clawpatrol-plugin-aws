@@ -15,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/denoland/clawpatrol/pluginsdk"
 
+	"github.com/akefirad/clawpatrol-plugin-aws/internal/awsact"
 	"github.com/akefirad/clawpatrol-plugin-aws/internal/awssign"
 	"github.com/akefirad/clawpatrol-plugin-aws/internal/awssso"
 )
@@ -135,11 +136,25 @@ func handleConn(ctx context.Context, conn gatewayConn, allow map[string]struct{}
 }
 
 func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, allow map[string]struct{}, minter roleMinter, resolver roleResolver) error {
+	// Acknowledge Expect: 100-continue before reading the body so an agent that
+	// waits for the go-ahead (S3 uploads do) streams it (ADR 0001 D12 write path).
+	if err := awssign.Ack100Continue(conn, req.Header); err != nil {
+		return fmt.Errorf("ack 100-continue: %w", err)
+	}
+
 	body, err := io.ReadAll(req.Body)
 	_ = req.Body.Close()
 
 	if err != nil {
 		return fmt.Errorf("read request body: %w", err)
+	}
+
+	// Decode aws-chunked upload bodies to the raw payload and drop the framing /
+	// checksum headers the from-scratch re-sign won't reproduce, so writes don't
+	// fail SignatureDoesNotMatch. A non-chunked body passes through unchanged.
+	body, err = awssign.NormalizeChunked(req, body)
+	if err != nil {
+		return fmt.Errorf("normalize request body: %w", err)
 	}
 
 	akid, ok := awssign.CredentialAKID(req.Header.Get("Authorization"))
@@ -160,17 +175,26 @@ func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, all
 
 	host := req.Host
 	service, region := awssign.ParseServiceRegion(host)
+	action := awsact.Action(req, body, service)
 
-	action := map[string]any{
+	facet := map[string]any{
 		fieldService:  service,
+		fieldAction:   action,
 		fieldAccount:  account,
 		fieldRegion:   region,
 		fieldResource: req.URL.Path,
 		fieldMethod:   req.Method,
 	}
-	summary := fmt.Sprintf("%s %s (%s/%s)", req.Method, service, account, region)
 
-	verdict, err := conn.Evaluate(ctx, FacetName, action, summary)
+	// iam_action is best-effort: omitted (not "") when undeterminable, so a
+	// rule matching on it fails closed rather than matching a guess (D8).
+	if iamAction, ok := awsact.IAMAction(service, action); ok {
+		facet[fieldIAMAction] = iamAction
+	}
+
+	summary := fmt.Sprintf("%s (%s/%s)", action, account, region)
+
+	verdict, err := conn.Evaluate(ctx, FacetName, facet, summary)
 	if err != nil {
 		return fmt.Errorf("evaluate %s: %w", summary, err)
 	}
