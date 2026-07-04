@@ -4,20 +4,28 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/denoland/clawpatrol/pluginsdk"
 
 	"github.com/akefirad/clawpatrol-plugin-aws/internal/awssign"
+	"github.com/akefirad/clawpatrol-plugin-aws/internal/awssso"
 )
 
 // EndpointTypeName is the HCL endpoint type this plugin registers.
 const EndpointTypeName = "aws_api"
+
+// credentialExpiryWindow is the refresh margin applied to every cached minted
+// credential: the CredentialsCache mints afresh once a role's temporary
+// credentials fall inside this window of their expiration.
+const credentialExpiryWindow = 5 * time.Minute
 
 // gatewayConn is the slice of *pluginsdk.Conn that handleConn needs: the
 // duplex agent connection plus the gateway's Evaluate and brokered DialUpstream
@@ -40,24 +48,52 @@ func Endpoint() pluginsdk.EndpointDef {
 		Family:   FacetName,
 		TLSMode:  pluginsdk.TLSTerminate,
 		HandleConn: func(ctx context.Context, conn *pluginsdk.Conn) error {
-			return handleConn(ctx, conn, conn.CredentialExtras)
+			region, token, role, err := endpointParams(conn.CredentialCanonicalConfig, conn.CredentialSecret)
+			if err != nil {
+				return err
+			}
+
+			minter := awssso.New(region, token, credentialExpiryWindow)
+
+			return handleConn(ctx, conn, minter, role)
 		},
 	}
+}
+
+// endpointParams reads the per-connection minting inputs off the gateway's
+// delivery: the SSO region and configured role from the credential's canonical
+// config, and the SSO access token from the credential's secret bytes (ADR
+// 0001 D9 — the gateway's OAuth flow delivers the token as
+// Conn.CredentialSecret). The account is not read here; it is decoded per
+// request from the SigV4 access-key id (ADR 0001 D5).
+func endpointParams(canonicalConfig, secret []byte) (region, token, role string, err error) {
+	var cfg ssoConfig
+	if err := json.Unmarshal(canonicalConfig, &cfg); err != nil {
+		return "", "", "", fmt.Errorf("decode aws_sso credential config: %w", err)
+	}
+
+	return cfg.Region, string(secret), cfg.RoleName, nil
 }
 
 // upstreamPort is the AWS HTTPS port every brokered dial targets.
 const upstreamPort = "443"
 
-// handleConn owns one agent connection: read each HTTP request, decode the
-// target account from the SigV4 access-key id, evaluate the aws facet, re-sign
-// with the seeded credentials, and proxy upstream via the gateway's dial.
-//
-// In this first cut the credentials are seeded (ADR 0001 D12): they arrive on
-// CredentialExtras (access_key_id / secret_access_key / session_token), which
-// is forward-compatible with later slices that mint them via SSO.
-func handleConn(ctx context.Context, conn gatewayConn, extras map[string]string) error {
-	creds := credentialsFromExtras(extras)
+// roleMinter is the slice of *awssso.Minter that handleConn needs: mint (or
+// serve cached) temporary credentials for a target account and role. Narrowing
+// to an interface keeps handleConn unit-testable.
+type roleMinter interface {
+	Credentials(ctx context.Context, account, role string) (aws.Credentials, error)
+}
 
+// handleConn owns one agent connection: read each HTTP request, decode the
+// target account from the SigV4 access-key id, evaluate the aws facet, mint
+// short-lived SSO credentials for the configured role, re-sign with them, and
+// proxy upstream via the gateway's dial.
+//
+// Credentials are minted live via sso:GetRoleCredentials and cached per
+// (account, role) by the minter (ADR 0001 D12): a burst reuses one mint, and
+// minting happens only after the verdict allows the request.
+func handleConn(ctx context.Context, conn gatewayConn, minter roleMinter, role string) error {
 	br := bufio.NewReader(conn)
 	for {
 		req, err := http.ReadRequest(br)
@@ -69,7 +105,7 @@ func handleConn(ctx context.Context, conn gatewayConn, extras map[string]string)
 			return fmt.Errorf("read request: %w", err)
 		}
 
-		if err := handleRequest(ctx, conn, req, creds); err != nil {
+		if err := handleRequest(ctx, conn, req, minter, role); err != nil {
 			return err
 		}
 
@@ -79,17 +115,7 @@ func handleConn(ctx context.Context, conn gatewayConn, extras map[string]string)
 	}
 }
 
-// credentialsFromExtras reads the seeded AWS credentials the gateway delivers
-// on CredentialExtras.
-func credentialsFromExtras(extras map[string]string) aws.Credentials {
-	return aws.Credentials{
-		AccessKeyID:     extras["access_key_id"],
-		SecretAccessKey: extras["secret_access_key"],
-		SessionToken:    extras["session_token"],
-	}
-}
-
-func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, creds aws.Credentials) error {
+func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, minter roleMinter, role string) error {
 	body, err := io.ReadAll(req.Body)
 	_ = req.Body.Close()
 
@@ -129,6 +155,13 @@ func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, cre
 		// proceed
 	default:
 		return writeError(conn, req, "aws_api: "+verdict.Reason)
+	}
+
+	// Mint only after the verdict allows, so a denied request never mints
+	// (ADR 0001 request flow). The minter caches per (account, role).
+	creds, err := minter.Credentials(ctx, account, role)
+	if err != nil {
+		return fmt.Errorf("mint credentials: %w", err)
 	}
 
 	signed, err := awssign.SignRequest(ctx, req, host, body, service, region, creds)

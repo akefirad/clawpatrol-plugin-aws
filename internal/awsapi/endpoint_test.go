@@ -4,28 +4,38 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/sso"
 	"github.com/denoland/clawpatrol/pluginsdk"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/akefirad/clawpatrol-plugin-aws/internal/awssso"
 )
 
-// The agent signs with the account's placeholder identity (ADR 0001 D5);
-// the endpoint decodes the account from it and re-signs with seeded creds.
+// The agent signs with the account's placeholder identity (ADR 0001 D5); the
+// endpoint decodes the account from it, mints real SSO credentials for the
+// configured role, and re-signs with the minted identity.
 const (
 	testPlaceholderAKID = "AKIA1234567890120000" // AKIA + account(123456789012) + padding
 	testAccount         = "123456789012"
+	testRole            = "ReadOnly"
+	testSSORegion       = "eu-central-1"
+	testSSOToken        = "sso-access-token-xyz" // delivered as Conn.CredentialSecret
 	testHost            = "sts.us-east-1.amazonaws.com"
 	testBody            = `{"Action":"GetCallerIdentity","Version":"2011-06-15"}`
 
-	seededAKID  = "ASIASEEDEDCREDS12345"
-	seededToken = "SEEDED-SESSION-TOKEN"
+	mintedAKID  = "ASIAMINTEDCREDS00001"
+	mintedToken = "minted-session-token"
 )
 
 // fakeUpstream is the net.Conn returned by the fake DialUpstream: it captures
@@ -92,12 +102,51 @@ func rawRequest() string {
 	)
 }
 
-func TestHandleConn_ReSignsWithSeededIdentityAndEvaluates(t *testing.T) {
+// mockSSOServer stands in for the SSO portal's GetRoleCredentials endpoint,
+// recording the bearer token it was called with so the test can prove minting
+// used the token delivered as CredentialSecret.
+type mockSSOServer struct {
+	server   *httptest.Server
+	seenAuth string
+}
+
+func newMockSSOServer(t *testing.T) *mockSSOServer {
+	t.Helper()
+
+	m := &mockSSOServer{}
+	m.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		m.seenAuth = r.Header.Get("X-Amz-Sso_bearer_token")
+
+		resp := fmt.Sprintf(
+			`{"roleCredentials":{"accessKeyId":%q,"secretAccessKey":%q,"sessionToken":%q,"expiration":%d}}`,
+			mintedAKID, "minted-secret-access-key", mintedToken, time.Now().Add(time.Hour).UnixMilli(),
+		)
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, resp)
+	}))
+	t.Cleanup(m.server.Close)
+
+	return m
+}
+
+func (m *mockSSOServer) minter() *awssso.Minter {
+	return awssso.New(testSSORegion, testSSOToken, time.Minute, awssso.WithClientFunc(func(region string) *sso.Client {
+		return sso.New(sso.Options{
+			Region:       region,
+			BaseEndpoint: aws.String(m.server.URL),
+			Credentials:  aws.AnonymousCredentials{},
+		})
+	}))
+}
+
+func TestHandleConn_MintsAndReSignsWithMintedIdentity(t *testing.T) {
 	t.Parallel()
 
 	is := assert.New(t)
 	must := require.New(t)
 
+	mock := newMockSSOServer(t)
 	upstream := &fakeUpstream{
 		response: bytes.NewReader([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")),
 	}
@@ -106,13 +155,8 @@ func TestHandleConn_ReSignsWithSeededIdentityAndEvaluates(t *testing.T) {
 		verdict:  pluginsdk.Verdict{Action: "allow"},
 		upstream: upstream,
 	}
-	extras := map[string]string{
-		"access_key_id":     seededAKID,
-		"secret_access_key": "seededsecretaccesskey0000000000000000000",
-		"session_token":     seededToken,
-	}
 
-	err := handleConn(context.Background(), conn, extras)
+	err := handleConn(context.Background(), conn, mock.minter(), testRole)
 	must.NoError(err)
 
 	// Evaluate ran against the minimal aws facet, account decoded from the AKID.
@@ -127,17 +171,37 @@ func TestHandleConn_ReSignsWithSeededIdentityAndEvaluates(t *testing.T) {
 	// Brokered dial targeted the AWS host.
 	is.Equal(testHost+":443", conn.dialAddr)
 
-	// The outbound request carries the seeded identity, not the placeholder.
+	// The outbound request carries the SSO-minted identity, not the placeholder.
 	out, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(upstream.written.Bytes())))
 	must.NoError(err)
 
 	authz := out.Header.Get("Authorization")
-	is.Contains(authz, "Credential="+seededAKID+"/")
+	is.Contains(authz, "Credential="+mintedAKID+"/")
 	is.NotContains(authz, testPlaceholderAKID)
-	is.Equal(seededToken, out.Header.Get("X-Amz-Security-Token"))
+	is.Equal(mintedToken, out.Header.Get("X-Amz-Security-Token"))
+
+	// Minting used the SSO access token delivered as CredentialSecret.
+	is.Equal(testSSOToken, mock.seenAuth)
 
 	// The upstream body is preserved through the re-sign.
 	body, err := io.ReadAll(out.Body)
 	must.NoError(err)
 	is.JSONEq(testBody, string(body))
+}
+
+func TestEndpointParams_ReadTokenFromCredentialSecret(t *testing.T) {
+	t.Parallel()
+
+	is := assert.New(t)
+	must := require.New(t)
+
+	cfg, err := json.Marshal(ssoConfig{Region: testSSORegion, AccountID: testAccount, RoleName: testRole})
+	must.NoError(err)
+
+	region, token, role, err := endpointParams(cfg, []byte(testSSOToken))
+	must.NoError(err)
+
+	is.Equal(testSSORegion, region)
+	is.Equal(testSSOToken, token)
+	is.Equal(testRole, role)
 }
