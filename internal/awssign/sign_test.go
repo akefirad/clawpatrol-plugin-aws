@@ -153,6 +153,38 @@ func TestSignRequest_S3DisablesURIPathDoubleEscaping(t *testing.T) {
 	is.Equal(plainDef, plainS3, "an unreserved-char key escapes to itself either way")
 }
 
+// TestSignRequest_ClearsChunkedTransferEncoding proves a request that arrived
+// with plain Transfer-Encoding: chunked is re-signed and written fixed-length:
+// the cloned TransferEncoding is cleared, so signed.Write emits a Content-Length
+// and no chunked framing (which would contradict the SigV4 payload hash).
+func TestSignRequest_ClearsChunkedTransferEncoding(t *testing.T) {
+	t.Parallel()
+
+	is := assert.New(t)
+	must := require.New(t)
+
+	const host = "sts.us-east-1.amazonaws.com"
+
+	req := incomingRequest(t, host, stsBody)
+	req.TransferEncoding = []string{"chunked"}
+
+	seeded := aws.Credentials{
+		AccessKeyID:     "ASIASEEDEDCREDS12345",
+		SecretAccessKey: "seededsecretaccesskey0000000000000000000",
+	}
+
+	out, err := awssign.SignRequest(context.Background(), req, host, []byte(stsBody), "sts", "us-east-1", seeded)
+	must.NoError(err)
+	is.Empty(out.TransferEncoding, "the cloned chunked Transfer-Encoding must be cleared")
+
+	var buf bytes.Buffer
+	must.NoError(out.Write(&buf))
+
+	wire := buf.String()
+	is.Contains(wire, "Content-Length:", "the re-signed request is written fixed-length")
+	is.NotContains(strings.ToLower(wire), "transfer-encoding: chunked")
+}
+
 // s3PutRequest builds a placeholder-signed S3 PUT for key, setting the path
 // directly so a space/reserved character survives into req.URL.Path.
 func s3PutRequest(t *testing.T, host, key string) *http.Request {

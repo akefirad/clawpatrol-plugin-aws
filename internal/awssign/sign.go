@@ -57,6 +57,13 @@ func SignRequest(
 		return io.NopCloser(bytes.NewReader(body)), nil
 	}
 
+	// req.Clone copies TransferEncoding, so a request that arrived with plain
+	// Transfer-Encoding: chunked (distinct from aws-chunked, which NormalizeChunked
+	// already handled) would still be written chunked and omit Content-Length —
+	// contradicting the fixed-length SigV4 payload hash -> SignatureDoesNotMatch.
+	// The body is always sent fixed-length here, so clear it.
+	out.TransferEncoding = nil
+
 	sum := sha256.Sum256(body)
 	payloadHash := hex.EncodeToString(sum[:])
 	out.Header.Set("X-Amz-Content-Sha256", payloadHash)
