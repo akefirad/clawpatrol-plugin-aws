@@ -3,6 +3,7 @@ package awsact
 import (
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 )
 
@@ -75,15 +76,19 @@ func s3BucketOp(q url.Values, method string) string {
 // s3ObjectOp resolves an object-addressed operation (including the multipart
 // lifecycle), or "" for a method with no recognized object operation.
 func s3ObjectOp(req *http.Request, q url.Values, method string) string {
-	if op := subresourceOp(s3ObjectSubresource, q, method); op != "" {
-		return op
-	}
-
+	// Resolve the multipart lifecycle before any subresource: an uploadId (or the
+	// ?uploads initiator) makes this a multipart op whatever else is on the query,
+	// so a lifecycle write like CompleteMultipartUpload (POST ?uploadId=…) can't be
+	// masked as a read subresource that also matches (e.g. ?select).
 	if _, initiating := q["uploads"]; initiating && method == http.MethodPost {
 		return "CreateMultipartUpload"
 	}
 
 	if op := s3MultipartOp(req, q, method); op != "" {
+		return op
+	}
+
+	if op := subresourceOp(s3ObjectSubresource, q, method); op != "" {
 		return op
 	}
 
@@ -171,15 +176,24 @@ func s3BucketInHost(host string) bool {
 	return first != "" && !strings.HasPrefix(first, "s3")
 }
 
-// subresourceOp returns the operation for the first recognized subresource
-// query key present for this method, or "" when none match.
+// subresourceOp returns the operation for the recognized subresource query key
+// present for this method, or "" when none match. When a request carries more
+// than one recognized subresource key (e.g. ?policy&acl) the keys are resolved
+// in a stable sorted order: ranging the map directly would pick the winner by
+// randomized map-iteration order, giving a nondeterministic audit verb and
+// letting a rule keyed on a specific aws.action be evaded ~half the time.
 func subresourceOp(table map[string]map[string]string, q url.Values, method string) string {
-	for key, byMethod := range table {
-		if _, present := q[key]; !present {
-			continue
+	present := make([]string, 0, len(table))
+	for key := range table {
+		if _, ok := q[key]; ok {
+			present = append(present, key)
 		}
+	}
 
-		if op, ok := byMethod[method]; ok {
+	sort.Strings(present)
+
+	for _, key := range present {
+		if op, ok := table[key][method]; ok {
 			return op
 		}
 	}

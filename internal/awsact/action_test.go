@@ -71,6 +71,29 @@ func TestAction_S3REST(t *testing.T) {
 	}
 }
 
+// A multipart lifecycle write must win over a co-present read subresource: a
+// POST carrying both ?uploadId and ?select is CompleteMultipartUpload (a write),
+// not SelectObjectContent (a read).
+func TestAction_S3MultipartBeatsSubresource(t *testing.T) {
+	t.Parallel()
+
+	req := newRequest(t, http.MethodPost, "s3.amazonaws.com", s3ObjectKey+"?uploadId=ABC&select", nil)
+
+	assert.Equal(t, "CompleteMultipartUpload", Action(req, nil, "s3"))
+}
+
+// Two recognized subresource keys on one request must classify deterministically
+// (stable across runs), not by randomized map order. Sorted precedence makes
+// ?policy&acl resolve to acl.
+func TestAction_S3MultipleSubresourcesDeterministic(t *testing.T) {
+	t.Parallel()
+
+	for range 50 {
+		req := newRequest(t, http.MethodPut, "s3.amazonaws.com", s3BucketPath+"?policy&acl", nil)
+		assert.Equal(t, "PutBucketAcl", Action(req, nil, "s3"))
+	}
+}
+
 func TestAction_JSONProtocolTarget(t *testing.T) {
 	t.Parallel()
 
