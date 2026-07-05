@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sso"
@@ -28,8 +29,9 @@ type mockRolesSSO struct {
 
 	roles      []string
 	calls      atomic.Int64
-	gotToken   atomic.Value // string
-	gotAccount atomic.Value // string
+	gotToken   atomic.Value  // string
+	gotAccount atomic.Value  // string
+	block      chan struct{} // when non-nil, each handler blocks until closed
 }
 
 func newMockRolesSSO(t *testing.T, roles ...string) *mockRolesSSO {
@@ -37,6 +39,10 @@ func newMockRolesSSO(t *testing.T, roles ...string) *mockRolesSSO {
 
 	m := &mockRolesSSO{roles: roles}
 	m.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if m.block != nil {
+			<-m.block
+		}
+
 		account := r.URL.Query().Get("account_id")
 
 		m.calls.Add(1)
@@ -101,6 +107,53 @@ func TestRoles_MultipleRolesIsError(t *testing.T) {
 	// The error names the candidate roles so the operator can pick one.
 	assert.Contains(t, err.Error(), "ReadOnly")
 	assert.Contains(t, err.Error(), "Admin")
+}
+
+func TestRoles_SlowDiscoveryDoesNotBlockCachedAccount(t *testing.T) {
+	t.Parallel()
+
+	const otherAccount = "999999999999"
+
+	m := newMockRolesSSO(t, testRole)
+	resolver := m.resolver(testRegion, testToken)
+
+	// Resolve (and cache) one account while the mock still serves freely.
+	_, err := resolver.Role(context.Background(), testAccount)
+	require.NoError(t, err)
+
+	// Now make every discovery block, and start a discovery for a different,
+	// uncached account — it parks inside ListAccountRoles holding no lock.
+	m.block = make(chan struct{})
+
+	discovering := make(chan struct{})
+
+	go func() {
+		close(discovering)
+
+		_, _ = resolver.Role(context.Background(), otherAccount)
+	}()
+
+	<-discovering
+
+	// The blocked discovery must not hold the mutex: a cache hit for the
+	// already-resolved account has to return promptly, not wait behind it.
+	done := make(chan string, 1)
+
+	go func() {
+		role, roleErr := resolver.Role(context.Background(), testAccount)
+		assert.NoError(t, roleErr)
+
+		done <- role
+	}()
+
+	select {
+	case role := <-done:
+		assert.Equal(t, testRole, role)
+	case <-time.After(2 * time.Second):
+		t.Fatal("a cache hit blocked behind an in-flight discovery for another account")
+	}
+
+	close(m.block) // release the parked discovery
 }
 
 func TestRoles_CachesResolvedRole(t *testing.T) {

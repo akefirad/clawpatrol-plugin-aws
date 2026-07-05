@@ -57,11 +57,25 @@ func SignRequest(
 		return io.NopCloser(bytes.NewReader(body)), nil
 	}
 
+	// req.Clone copies TransferEncoding, so a request that arrived with plain
+	// Transfer-Encoding: chunked (distinct from aws-chunked, which NormalizeChunked
+	// already handled) would still be written chunked and omit Content-Length —
+	// contradicting the fixed-length SigV4 payload hash -> SignatureDoesNotMatch.
+	// The body is always sent fixed-length here, so clear it.
+	out.TransferEncoding = nil
+
 	sum := sha256.Sum256(body)
 	payloadHash := hex.EncodeToString(sum[:])
 	out.Header.Set("X-Amz-Content-Sha256", payloadHash)
 
-	signer := v4.NewSigner()
+	// S3 is the one service that must not re-escape the canonical URI path (the
+	// AWS S3 client sets DisableURIPathEscaping too): a key like "my file+name.txt"
+	// would otherwise be double-encoded ("my%2520file…"), which S3's
+	// canonicalization won't match -> SignatureDoesNotMatch. Every other service
+	// keeps the default single escaping.
+	signer := v4.NewSigner(func(o *v4.SignerOptions) {
+		o.DisableURIPathEscaping = service == "s3"
+	})
 	if err := signer.SignHTTP(ctx, creds, out, payloadHash, service, region, time.Now().UTC()); err != nil {
 		return nil, fmt.Errorf("sigv4 sign %s/%s: %w", service, region, err)
 	}

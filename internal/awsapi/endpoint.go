@@ -167,7 +167,9 @@ type connHandler struct {
 
 // forwardParams is the per-request input to forwarding: the request, its
 // already-read and chunk-normalized body, and the routing/signing attributes
-// derived from it (account, host, and the SigV4 service/region).
+// derived from it (account, host, the SigV4 service/region, and the resolved
+// action — the last two gate whether the response body is sampled into the
+// audit store, see reportResponse).
 type forwardParams struct {
 	req     *http.Request
 	body    []byte
@@ -175,6 +177,7 @@ type forwardParams struct {
 	host    string
 	service string
 	region  string
+	action  string
 }
 
 // handleConn owns one agent connection: read each HTTP request, decode the
@@ -388,6 +391,7 @@ func (h *connHandler) handleRequest(ctx context.Context, req *http.Request) (clo
 		host:    host,
 		service: service,
 		region:  region,
+		action:  action,
 	}); err != nil {
 		// Tag the error with the account and host so the HandleConn log names the
 		// failing request (the underlying wraps already carry the SSO/dial detail).
@@ -490,8 +494,10 @@ func (h *connHandler) forwardRequest(ctx context.Context, p forwardParams) error
 	defer func() { _ = resp.Body.Close() }()
 
 	// Write the response to the agent and report its outcome (status + a bounded
-	// body sample) to the gateway via SetResult (ADR 0001 D8 result fields).
-	if err := reportResponse(ctx, conn, resp); err != nil {
+	// body sample) to the gateway via SetResult (ADR 0001 D8 result fields). The
+	// service/action gate whether the body is sampled — secret-returning responses
+	// are not teed into the audit store.
+	if err := reportResponse(ctx, conn, resp, p.service, p.action); err != nil {
 		return fmt.Errorf("write response to agent: %w", err)
 	}
 

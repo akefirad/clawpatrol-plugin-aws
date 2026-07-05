@@ -11,6 +11,36 @@ import (
 // JSON-protocol services set the error code in.
 const errorTypeHeader = "X-Amzn-Errortype"
 
+// TestResponseCarriesSecret verifies the secret-returning (service, action)
+// pairs whose response body is withheld from the audit store, and that sibling
+// non-secret reads on the same services are still sampled.
+func TestResponseCarriesSecret(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		service string
+		action  string
+		want    bool
+	}{
+		{serviceSecretsManager, "GetSecretValue", true},
+		{serviceSecretsManager, "DescribeSecret", false},
+		{serviceSSM, "GetParameter", true},
+		{serviceSSM, "GetParameters", true},
+		{serviceSSM, "GetParametersByPath", true},
+		{serviceSSM, "DescribeParameters", false},
+		{serviceSTS, "AssumeRole", true},
+		{serviceSTS, "AssumeRoleWithWebIdentity", true},
+		{serviceSTS, "GetSessionToken", true},
+		{serviceSTS, "GetCallerIdentity", false},
+		{"s3", "GetObject", false},
+		{"dynamodb", "GetItem", false},
+	}
+
+	for _, tc := range cases {
+		assert.Equal(t, tc.want, responseCarriesSecret(tc.service, tc.action), "%s/%s", tc.service, tc.action)
+	}
+}
+
 // TestErrorCode covers the representative shapes AWS surfaces an error code in:
 // the x-amzn-errortype header (bare, shape-prefixed, URL-suffixed), an S3/query
 // XML <Code>, and a JSON __type / code. The header wins over the body, and a

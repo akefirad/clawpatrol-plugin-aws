@@ -82,11 +82,18 @@ approver "human_approver" "s3-writes" {
 
 // Reads allow. iam_action is the right lever for reads (ADR 0001 D8): a missing
 // mapping just over-denies, which fails closed = safe. Match IAM-style with
-// startsWith or a regex; also allow the read-shaped HTTP methods so ops without
-// an iam_action mapping (e.g. an unmapped Describe/List) still pass as reads.
+// startsWith or a regex.
+//
+// Deliberately NOT `|| aws.method in ['GET', 'HEAD']`: unlike S3 (a REST service
+// where GET/HEAD are genuinely read-only), the query-protocol services on this
+// endpoint (EC2, RDS, SNS, SQS, ELB, AutoScaling, …) accept mutations over GET —
+// `GET /?Action=TerminateInstances` is a write. A blanket GET/HEAD allow would
+// out-prioritize aws-default-deny and let the plugin mint + forward that
+// destructive call (the inverse of ADR 0001 D8). The cost is that an unmapped
+// read (no iam_action) over-denies; add a rule to permit the specific action.
 rule "aws-reads" {
   endpoint  = aws_api.aws
-  condition = "aws.iam_action.matches('^[a-z0-9-]+:(Get|List|Describe|Head|BatchGet).*') || aws.method in ['GET', 'HEAD']"
+  condition = "aws.iam_action.matches('^[a-z0-9-]+:(Get|List|Describe|Head|BatchGet).*')"
   verdict   = "allow"
 }
 

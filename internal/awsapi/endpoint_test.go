@@ -759,6 +759,54 @@ func TestReportResponse_SetResultFailureIsBestEffort(t *testing.T) {
 	is.Equal(1, conn.resultCalls)
 }
 
+func TestReportResponse_SecretServiceBodyNotSampled(t *testing.T) {
+	t.Parallel()
+
+	is := assert.New(t)
+	must := require.New(t)
+
+	const (
+		host   = "secretsmanager.us-east-1.amazonaws.com"
+		secret = "super-secret-value-plaintext"
+	)
+
+	// A Secrets Manager GetSecretValue: JSON protocol, so the op is carried in
+	// X-Amz-Target. The account is still decoded from the placeholder AKID.
+	raw := fmt.Sprintf(
+		"POST / HTTP/1.1\r\n"+
+			"Host: %s\r\n"+
+			"Authorization: AWS4-HMAC-SHA256 Credential=%s/20200101/us-east-1/secretsmanager/aws4_request, SignedHeaders=host, Signature=deadbeef\r\n"+
+			"Content-Type: application/x-amz-json-1.1\r\n"+
+			"X-Amz-Target: secretsmanager.GetSecretValue\r\n"+
+			"Content-Length: 2\r\n"+
+			"\r\n{}",
+		host, testPlaceholderAKID,
+	)
+
+	mock := newMockSSOServer(t)
+	conn := &fakeConn{
+		incoming: bytes.NewReader([]byte(raw)),
+		verdict:  pluginsdk.Verdict{Action: verdictAllow},
+		upstream: &fakeUpstream{response: bytes.NewReader([]byte(rawResp("200 OK", "application/x-amz-json-1.1", secret)))},
+	}
+
+	err := handleConn(context.Background(), conn, host, testMaxBody, allowlist(testAccount), mock.minter(), &fakeResolver{role: testRole}, testCredInstance, true)
+	must.NoError(err)
+
+	// The agent still receives the complete secret body — only the audit tee is
+	// skipped.
+	_, body := agentResponse(t, conn)
+	is.Equal(secret, string(body))
+
+	// The op classified as GetSecretValue, and its body is withheld from the audit
+	// store: the status is reported but response_body is absent.
+	is.Equal("GetSecretValue", conn.evalAction["action"])
+	is.Equal(1, conn.resultCalls)
+	is.Equal("200", conn.result[resultFieldStatus])
+	is.NotContains(conn.result, resultFieldResponseBody)
+	is.Empty(conn.resultSample)
+}
+
 // runForwardFailure drives an allowed on-allowlist request through handleConn
 // with the given (failing) minter/resolver and asserts HandleConn surfaced the
 // error to log (S4). It returns the fakeConn so the caller can assert the

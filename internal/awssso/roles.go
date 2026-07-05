@@ -18,9 +18,9 @@ import (
 // only ever narrows within the account boundary — the account allowlist itself
 // is never discovered (ADR 0001 D4). Safe for concurrent use.
 type Roles struct {
-	region    string
 	token     string
 	newClient ssoClientFunc
+	client    *sso.Client // built once in NewRoles; region is fixed per instance
 
 	mu    sync.Mutex
 	cache map[string]string // account -> resolved role
@@ -42,7 +42,6 @@ func WithRolesClientFunc(fn ssoClientFunc) RolesOption {
 // network of its own (ADR 0001 Capabilities).
 func NewRoles(region, token string, dial DialFunc, opts ...RolesOption) *Roles {
 	r := &Roles{
-		region:    region,
 		token:     token,
 		newClient: func(rg string) *sso.Client { return newSSOClient(rg, dial) },
 		cache:     make(map[string]string),
@@ -52,17 +51,31 @@ func NewRoles(region, token string, dial DialFunc, opts ...RolesOption) *Roles {
 		opt(r)
 	}
 
+	// Build the SSO client once: the region is fixed for the instance and
+	// sso.Client (with its brokered transport) is safe for concurrent reuse, so
+	// there is no need to rebuild it per discovery.
+	r.client = r.newClient(region)
+
 	return r
 }
 
 // Role returns the single auto-discovered role for the account, serving the
 // cached value after the first lookup. Zero or multiple roles are a clear
 // error; the multiple-roles error names the candidates.
+//
+// The lock guards only the cache reads/writes, never the ListAccountRoles
+// network call: under the cross-connection sharing this type is built for (ADR
+// #10), holding it across discovery would make a slow or hung lookup for one
+// account block every other goroutine's Role() call, including cache hits for
+// already-resolved accounts. The tradeoff is that a concurrent burst for the
+// same uncached account may discover more than once; discovery is idempotent and
+// the writes converge, so that is benign.
 func (r *Roles) Role(ctx context.Context, account string) (string, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	role, ok := r.cache[account]
+	r.mu.Unlock()
 
-	if role, ok := r.cache[account]; ok {
+	if ok {
 		return role, nil
 	}
 
@@ -71,7 +84,9 @@ func (r *Roles) Role(ctx context.Context, account string) (string, error) {
 		return "", err
 	}
 
+	r.mu.Lock()
 	r.cache[account] = role
+	r.mu.Unlock()
 
 	return role, nil
 }
@@ -79,15 +94,13 @@ func (r *Roles) Role(ctx context.Context, account string) (string, error) {
 // discover lists every role the SSO session grants on the account (following
 // pagination) and enforces the single-role rule.
 func (r *Roles) discover(ctx context.Context, account string) (string, error) {
-	client := r.newClient(r.region)
-
 	var (
 		roles []string
 		next  *string
 	)
 
 	for {
-		out, err := client.ListAccountRoles(ctx, &sso.ListAccountRolesInput{
+		out, err := r.client.ListAccountRoles(ctx, &sso.ListAccountRolesInput{
 			AccessToken: aws.String(r.token),
 			AccountId:   aws.String(account),
 			NextToken:   next,
