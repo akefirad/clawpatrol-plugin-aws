@@ -62,11 +62,20 @@ func NewRoles(region, token string, dial DialFunc, opts ...RolesOption) *Roles {
 // Role returns the single auto-discovered role for the account, serving the
 // cached value after the first lookup. Zero or multiple roles are a clear
 // error; the multiple-roles error names the candidates.
+//
+// The lock guards only the cache reads/writes, never the ListAccountRoles
+// network call: under the cross-connection sharing this type is built for (ADR
+// #10), holding it across discovery would make a slow or hung lookup for one
+// account block every other goroutine's Role() call, including cache hits for
+// already-resolved accounts. The tradeoff is that a concurrent burst for the
+// same uncached account may discover more than once; discovery is idempotent and
+// the writes converge, so that is benign.
 func (r *Roles) Role(ctx context.Context, account string) (string, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	role, ok := r.cache[account]
+	r.mu.Unlock()
 
-	if role, ok := r.cache[account]; ok {
+	if ok {
 		return role, nil
 	}
 
@@ -75,7 +84,9 @@ func (r *Roles) Role(ctx context.Context, account string) (string, error) {
 		return "", err
 	}
 
+	r.mu.Lock()
 	r.cache[account] = role
+	r.mu.Unlock()
 
 	return role, nil
 }
