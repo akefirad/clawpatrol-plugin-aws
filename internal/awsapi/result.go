@@ -40,17 +40,25 @@ const responseSampleCap = 16 << 10 // 16 KiB
 //     on a 4xx/5xx when one is determinable from the headers/body.
 //   - response_body: a bounded sample of the body, teed as the agent's copy is
 //     written so the agent still receives the complete, unmodified response.
+//     Omitted for responses that carry secrets or credentials (see
+//     responseCarriesSecret).
 //
-// Note (operator-facing): the response_body sample means up to responseSampleCap
-// bytes of every upstream RESPONSE body are captured into the gateway's audit
-// store — for example the leading bytes of an S3 GetObject payload, i.e. a
-// sample of customer object data. This is intentional (it makes the response
-// auditable), but operators should know their audit store holds a partial copy
-// of response payloads.
+// Note (operator-facing): except for the secret-returning responses excluded
+// below, up to responseSampleCap bytes of every upstream RESPONSE body are
+// captured into the gateway's audit store — for example the leading bytes of an
+// S3 GetObject payload (a sample of customer object data), or an error/JSON
+// response. This is intentional (it makes responses auditable), but operators
+// should know their audit store holds a partial copy of response payloads. There
+// is no field-level redaction hook in this cut (ADR 0001 D12), so the plugin
+// instead withholds the whole body sample for the services/operations whose
+// responses are secrets or credentials by definition (Secrets Manager
+// GetSecretValue, SSM GetParameter*, STS AssumeRole*/GetSessionToken/…). The
+// status is still reported for those, so the call remains auditable without
+// persisting the secret.
 //
 // The agent's response is authoritative: a SetResult failure is best-effort
 // (the agent already has its bytes) and never fails the request.
-func reportResponse(ctx context.Context, conn resultConn, resp *http.Response) error {
+func reportResponse(ctx context.Context, conn resultConn, resp *http.Response, service, action string) error {
 	status := strconv.Itoa(resp.StatusCode)
 
 	// On a 4xx/5xx, surface the AWS error code instead of the bare status. Peek a
@@ -68,26 +76,64 @@ func reportResponse(ctx context.Context, conn resultConn, resp *http.Response) e
 		}
 	}
 
-	// Tee the body into a bounded sample as resp.Write drains it to the agent.
-	// The agent's copy is unaffected; the tap only observes.
-	tap := &boundedTap{limit: responseSampleCap}
-	resp.Body = readCloser{
-		Reader: io.TeeReader(resp.Body, tap),
-		Closer: resp.Body,
+	// Withhold the body sample entirely for secret-returning responses: without a
+	// redaction hook, sampling would land a plaintext secret / temporary
+	// credentials in the audit store. The agent still gets the full body; only the
+	// audit tee is skipped.
+	sampleBody := !responseCarriesSecret(service, action)
+
+	var tap *boundedTap
+	if sampleBody {
+		// Tee the body into a bounded sample as resp.Write drains it to the agent.
+		// The agent's copy is unaffected; the tap only observes.
+		tap = &boundedTap{limit: responseSampleCap}
+		resp.Body = readCloser{
+			Reader: io.TeeReader(resp.Body, tap),
+			Closer: resp.Body,
+		}
 	}
 
 	if err := resp.Write(conn); err != nil {
 		return err
 	}
 
+	result := map[string]any{resultFieldStatus: status}
+	if sampleBody {
+		result[resultFieldResponseBody] = pluginsdk.Stream(bytes.NewReader(tap.buf.Bytes()))
+	}
+
 	// Best-effort: the response is already delivered, so a reporting failure must
 	// not tear down the connection.
-	_ = conn.SetResult(ctx, map[string]any{
-		resultFieldStatus:       status,
-		resultFieldResponseBody: pluginsdk.Stream(bytes.NewReader(tap.buf.Bytes())),
-	})
+	_ = conn.SetResult(ctx, result)
 
 	return nil
+}
+
+// responseCarriesSecret reports whether a (service, action)'s response body is a
+// secret or credential material that must not be sampled into the audit store.
+// These operations return plaintext secrets or temporary credentials by
+// definition; sibling reads on the same service (STS GetCallerIdentity, Secrets
+// Manager DescribeSecret, …) are not excluded, so ordinary auditing is retained.
+func responseCarriesSecret(service, action string) bool {
+	switch service {
+	case "secretsmanager":
+		return action == "GetSecretValue"
+	case "ssm":
+		// SSM parameter reads can return SecureString plaintext; the action alone
+		// does not reveal the type, so exclude all parameter fetches.
+		switch action {
+		case "GetParameter", "GetParameters", "GetParametersByPath":
+			return true
+		}
+	case "sts":
+		switch action {
+		case "AssumeRole", "AssumeRoleWithSAML", "AssumeRoleWithWebIdentity",
+			"GetSessionToken", "GetFederationToken":
+			return true
+		}
+	}
+
+	return false
 }
 
 // peekBody reads up to limit bytes off r and returns them plus a reader for the
