@@ -41,6 +41,13 @@ const responseSampleCap = 16 << 10 // 16 KiB
 //   - response_body: a bounded sample of the body, teed as the agent's copy is
 //     written so the agent still receives the complete, unmodified response.
 //
+// Note (operator-facing): the response_body sample means up to responseSampleCap
+// bytes of every upstream RESPONSE body are captured into the gateway's audit
+// store — for example the leading bytes of an S3 GetObject payload, i.e. a
+// sample of customer object data. This is intentional (it makes the response
+// auditable), but operators should know their audit store holds a partial copy
+// of response payloads.
+//
 // The agent's response is authoritative: a SetResult failure is best-effort
 // (the agent already has its bytes) and never fails the request.
 func reportResponse(ctx context.Context, conn resultConn, resp *http.Response) error {

@@ -30,6 +30,11 @@ const (
 // status (the HTTP code, or the AWS error code on a 4xx/5xx) is the result
 // Title; response_body is a bounded body sample (a FacetStream the gateway
 // caps). account_name (Organizations) stays deferred to a later slice.
+//
+// Operator note: response_body means a bounded sample of every upstream
+// response body is captured into the gateway's audit store — including a sample
+// of returned payload data (e.g. the leading bytes of an S3 GetObject object).
+// Responses are therefore partially recorded; see reportResponse.
 func Facet() pluginsdk.FacetDef {
 	return pluginsdk.FacetDef{
 		Name: FacetName,
