@@ -133,7 +133,7 @@ func Endpoint() pluginsdk.EndpointDef {
 func endpointParams(canonicalConfig, secret []byte) (region, token string, accounts []string, err error) {
 	var cfg ssoConfig
 	if err := json.Unmarshal(canonicalConfig, &cfg); err != nil {
-		return "", "", nil, fmt.Errorf("decode aws_sso credential config: %w", err)
+		return "", "", nil, fmt.Errorf("decode aws_sso_credential config: %w", err)
 	}
 
 	return cfg.Region, string(secret), cfg.Accounts, nil
@@ -415,7 +415,7 @@ func (h *connHandler) handleRequest(ctx context.Context, req *http.Request) (clo
 // URL is configured in this cut, and no token or credential material is included.
 func reauthReason(credInstance string) string {
 	return fmt.Sprintf(
-		"aws_sso: AWS SSO session expired; an operator must reconnect the %q credential in the clawpatrol dashboard",
+		"aws_sso_credential: AWS SSO session expired; an operator must reconnect the %q credential in the clawpatrol dashboard",
 		credInstance,
 	)
 }

@@ -63,7 +63,7 @@ endpoint "aws_api" "aws" {
 // account across both endpoints (ADR 0001 D3). Roles are auto-discovered per
 // account (single role per account) and placeholders are derived from the
 // account id — no per-account config.
-credential "aws_sso" "wp" {
+credential "aws_sso_credential" "wp" {
   start_url = "https://my-org.awsapps.com/start"
   region    = "eu-central-1" // SSO / Identity Center region
   endpoints = [aws_api.aws, aws_api.s3]
@@ -146,5 +146,5 @@ rule "s3-default-deny" {
 // these CEL rules the secondary observability + HITL layer.
 
 profile "default" {
-  credentials = [aws_sso.wp]
+  credentials = [aws_sso_credential.wp]
 }

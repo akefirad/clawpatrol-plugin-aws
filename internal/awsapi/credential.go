@@ -11,7 +11,7 @@ import (
 )
 
 // CredentialTypeName is the HCL credential type this plugin registers.
-const CredentialTypeName = "aws_sso"
+const CredentialTypeName = "aws_sso_credential"
 
 // ssoConfig is the decoded aws_sso credential body.
 //
@@ -27,7 +27,7 @@ type ssoConfig struct {
 	Accounts []string `json:"accounts"`
 }
 
-// Credential declares the aws_sso credential type.
+// Credential declares the aws_sso_credential credential type.
 //
 // It carries no login code (ADR 0001 D9, Path A): the OAuthIntegration below
 // wires the dashboard Connect card to the gateway core's ssooidc device flow
@@ -49,15 +49,15 @@ func Credential() pluginsdk.CredentialDef {
 func buildCredential(req pluginsdk.BuildRequest) (any, error) {
 	var cfg ssoConfig
 	if err := req.Decode(&cfg); err != nil {
-		return nil, fmt.Errorf("decode aws_sso config: %w", err)
+		return nil, fmt.Errorf("decode aws_sso_credential config: %w", err)
 	}
 
 	if cfg.StartURL == "" {
-		return nil, errors.New("aws_sso: start_url is required")
+		return nil, errors.New("aws_sso_credential: start_url is required")
 	}
 
 	if cfg.Region == "" {
-		return nil, errors.New("aws_sso: region is required")
+		return nil, errors.New("aws_sso_credential: region is required")
 	}
 
 	if err := validateAccounts(cfg.Accounts); err != nil {
@@ -85,17 +85,17 @@ func buildCredential(req pluginsdk.BuildRequest) (any, error) {
 // non-empty list of 12-digit account ids, each appearing at most once.
 func validateAccounts(accounts []string) error {
 	if len(accounts) == 0 {
-		return errors.New("aws_sso: accounts is required and must list at least one account id")
+		return errors.New("aws_sso_credential: accounts is required and must list at least one account id")
 	}
 
 	seen := make(map[string]struct{}, len(accounts))
 	for _, id := range accounts {
 		if !isAccountID(id) {
-			return fmt.Errorf("aws_sso: account %q is not a 12-digit account id", id)
+			return fmt.Errorf("aws_sso_credential: account %q is not a 12-digit account id", id)
 		}
 
 		if _, dup := seen[id]; dup {
-			return fmt.Errorf("aws_sso: duplicate account %q in accounts", id)
+			return fmt.Errorf("aws_sso_credential: duplicate account %q in accounts", id)
 		}
 
 		seen[id] = struct{}{}

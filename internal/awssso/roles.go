@@ -124,10 +124,10 @@ func (r *Roles) discover(ctx context.Context, account string) (string, error) {
 	case 1:
 		return roles[0], nil
 	case 0:
-		return "", fmt.Errorf("aws_sso: account %s grants no roles for this SSO session", account)
+		return "", fmt.Errorf("aws_sso_credential: account %s grants no roles for this SSO session", account)
 	default:
 		return "", fmt.Errorf(
-			"aws_sso: account %s grants multiple roles (%s); a single role per account is required",
+			"aws_sso_credential: account %s grants multiple roles (%s); a single role per account is required",
 			account, strings.Join(roles, ", "),
 		)
 	}

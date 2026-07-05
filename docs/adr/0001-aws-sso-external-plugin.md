@@ -43,7 +43,7 @@ dispatch) but differ in the **minting** half (`GetRoleCredentials` vs
 
 ### D1 — Credential model is AWS SSO, not account-based
 
-The credential type is `aws_sso`. One SSO authentication (`start_url` + SSO
+The credential type is `aws_sso_credential`. One SSO authentication (`start_url` + SSO
 `region` → one device login → one stored token) serves many accounts.
 
 ### D2 — The account is the sole per-request dispatch key; role is fixed config
@@ -57,7 +57,7 @@ as a second credential, not a per-request switch.
 ### D3 — Credential schema: a per-account allowlist
 
 ```hcl
-credential "aws_sso" "wp" {
+credential "aws_sso_credential" "wp" {
   start_url = "https://<org>.awsapps.com/start"
   region    = "eu-central-1"                     # SSO / Identity Center region
   endpoints = [aws_api.aws, aws_api.s3]          # one session, many endpoints
@@ -273,7 +273,7 @@ the request), and it surfaces the re-auth need on three channels instead of
 failing opaquely:
 
 1. **Agent (request response):** deny with a clear, *recognizable* error — e.g.
-   `aws_sso: AWS SSO session expired; an operator must reconnect the
+   `aws_sso_credential: AWS SSO session expired; an operator must reconnect the
    "<credential>" credential in the clawpatrol dashboard` — so the calling agent
    gets an actionable signal, not a generic 403.
 2. **Dashboard:** the Connect card already reflects the expired state via the
