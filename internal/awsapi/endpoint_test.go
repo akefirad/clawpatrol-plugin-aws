@@ -238,7 +238,7 @@ func TestHandleConn_AllowedAccountMintsAndReSigns(t *testing.T) {
 	}
 	resolver := &fakeResolver{role: testRole}
 
-	err := handleConn(context.Background(), conn, allowlist(testAccount), mock.minter(), resolver, testCredInstance, true)
+	err := handleConn(context.Background(), conn, testHost, allowlist(testAccount), mock.minter(), resolver, testCredInstance, true)
 	must.NoError(err)
 
 	// The account on the allowlist resolved its role and proceeded.
@@ -331,7 +331,7 @@ func TestHandleConn_S3PutObjectChunkedReSigns(t *testing.T) {
 	}
 	resolver := &fakeResolver{role: testRole}
 
-	err := handleConn(context.Background(), conn, allowlist(testAccount), mock.minter(), resolver, testCredInstance, true)
+	err := handleConn(context.Background(), conn, s3Host, allowlist(testAccount), mock.minter(), resolver, testCredInstance, true)
 	must.NoError(err)
 
 	// The enriched facet reached Evaluate with the reconstructed S3 op.
@@ -390,7 +390,7 @@ func TestHandleConn_HITLAllowProceeds(t *testing.T) {
 	}
 	resolver := &fakeResolver{role: testRole}
 
-	err := handleConn(context.Background(), conn, allowlist(testAccount), mock.minter(), resolver, testCredInstance, true)
+	err := handleConn(context.Background(), conn, testHost, allowlist(testAccount), mock.minter(), resolver, testCredInstance, true)
 	must.NoError(err)
 
 	// The approved request resolved its role, minted fresh, and dialed upstream.
@@ -405,6 +405,68 @@ func TestHandleConn_HITLAllowProceeds(t *testing.T) {
 	must.NoError(err)
 	is.Contains(out.Header.Get("Authorization"), "Credential="+mintedAKID+"/")
 	is.Equal(mintedToken, out.Header.Get("X-Amz-Security-Token"))
+}
+
+// TestHandleConn_HostMatchesRoute proves the S2 confused-deputy guard: the
+// handler proceeds only when the agent's HTTP Host matches the host the gateway
+// routed this connection to (conn.UpstreamHost), and fails closed with a 421
+// before any policy evaluation or SSO work when they diverge (routed to
+// dynamodb... but Host: sts...).
+func TestHandleConn_HostMatchesRoute(t *testing.T) {
+	t.Parallel()
+
+	t.Run("matching host proceeds", func(t *testing.T) {
+		t.Parallel()
+
+		is := assert.New(t)
+		must := require.New(t)
+
+		mock := newMockSSOServer(t)
+		conn := &fakeConn{
+			incoming: bytes.NewReader([]byte(rawRequest(testPlaceholderAKID))), // Host: sts...
+			verdict:  pluginsdk.Verdict{Action: verdictAllow},
+			upstream: &fakeUpstream{response: bytes.NewReader([]byte(rawResp("200 OK", "text/plain", "ok")))},
+		}
+		resolver := &fakeResolver{role: testRole}
+
+		// The routed host equals the request Host, so the request proceeds and dials.
+		err := handleConn(context.Background(), conn, testHost, allowlist(testAccount), mock.minter(), resolver, testCredInstance, true)
+		must.NoError(err)
+
+		is.Equal(1, resolver.calls)
+		is.Equal(testHost+":443", conn.dialAddr)
+	})
+
+	t.Run("diverging host fails closed", func(t *testing.T) {
+		t.Parallel()
+
+		is := assert.New(t)
+		must := require.New(t)
+
+		conn := &fakeConn{
+			incoming: bytes.NewReader([]byte(rawRequest(testPlaceholderAKID))), // Host: sts...
+			verdict:  pluginsdk.Verdict{Action: verdictAllow},                  // an allow must not save it
+		}
+		minter := &fakeMinter{}
+		resolver := &fakeResolver{role: testRole}
+
+		// The gateway routed this connection to a different host than the agent's
+		// Host header addresses — a confused-deputy attempt.
+		const routedHost = "dynamodb.us-east-1.amazonaws.com"
+
+		err := handleConn(context.Background(), conn, routedHost, allowlist(testAccount), minter, resolver, testCredInstance, true)
+		must.NoError(err)
+
+		status, body := agentResponse(t, conn)
+		is.Equal(http.StatusMisdirectedRequest, status)
+		is.Contains(string(body), "does not match the routed endpoint host")
+
+		// Failed closed before evaluating policy or doing any SSO work.
+		is.Equal(0, conn.evalCalls, "a misrouted request must not be evaluated")
+		is.Equal(0, resolver.calls)
+		is.Equal(0, minter.calls)
+		is.Empty(conn.dialAddr)
+	})
 }
 
 // TestHandleConn_DenyVerdictsBlock proves deny and hitl_deny both block with no
@@ -424,7 +486,7 @@ func TestHandleConn_DenyVerdictsBlock(t *testing.T) {
 			minter := &fakeMinter{}
 			resolver := &fakeResolver{role: testRole}
 
-			err := handleConn(context.Background(), conn, allowlist(testAccount), minter, resolver, testCredInstance, true)
+			err := handleConn(context.Background(), conn, testHost, allowlist(testAccount), minter, resolver, testCredInstance, true)
 			require.NoError(t, err)
 
 			// The account is on the allowlist, so it was evaluated — but the
@@ -455,7 +517,7 @@ func TestHandleConn_ExpiredSessionSurfacesReauth(t *testing.T) {
 
 	// hasToken=false models the empty CredentialSecret the gateway delivers on an
 	// expired session.
-	err := handleConn(context.Background(), conn, allowlist(testAccount), minter, resolver, testCredInstance, false)
+	err := handleConn(context.Background(), conn, testHost, allowlist(testAccount), minter, resolver, testCredInstance, false)
 	must.NoError(err)
 
 	// Denied with a recognizable re-auth error naming the credential — no SSO work.
@@ -490,7 +552,7 @@ func TestHandleConn_ExpiredSessionEmitsAuditEvent(t *testing.T) {
 		verdict:  pluginsdk.Verdict{Action: verdictAllow},
 	}
 
-	err := handleConn(context.Background(), conn, allowlist(testAccount), &fakeMinter{}, &fakeResolver{role: testRole}, testCredInstance, false)
+	err := handleConn(context.Background(), conn, testHost, allowlist(testAccount), &fakeMinter{}, &fakeResolver{role: testRole}, testCredInstance, false)
 	must.NoError(err)
 
 	// Exactly one supplementary audit event for the denied-for-reauth request.
@@ -519,7 +581,7 @@ func runAllowed(t *testing.T, rawResponse string) *fakeConn {
 		upstream: &fakeUpstream{response: bytes.NewReader([]byte(rawResponse))},
 	}
 
-	err := handleConn(context.Background(), conn, allowlist(testAccount), mock.minter(), &fakeResolver{role: testRole}, testCredInstance, true)
+	err := handleConn(context.Background(), conn, testHost, allowlist(testAccount), mock.minter(), &fakeResolver{role: testRole}, testCredInstance, true)
 	require.NoError(t, err)
 
 	return conn
@@ -631,7 +693,7 @@ func TestReportResponse_SetResultFailureIsBestEffort(t *testing.T) {
 
 	// A SetResult failure must not fail the request — the agent already has its
 	// response.
-	err := handleConn(context.Background(), conn, allowlist(testAccount), mock.minter(), &fakeResolver{role: testRole}, testCredInstance, true)
+	err := handleConn(context.Background(), conn, testHost, allowlist(testAccount), mock.minter(), &fakeResolver{role: testRole}, testCredInstance, true)
 	must.NoError(err)
 
 	_, body := agentResponse(t, conn)
@@ -670,7 +732,7 @@ func TestHandleConn_UnknownAccountDenied(t *testing.T) {
 	resolver := &fakeResolver{role: testRole}
 
 	// testAccount is not on the allowlist.
-	err := handleConn(context.Background(), conn, allowlist("999999999999"), minter, resolver, testCredInstance, true)
+	err := handleConn(context.Background(), conn, testHost, allowlist("999999999999"), minter, resolver, testCredInstance, true)
 	require.NoError(t, err)
 
 	denied(t, conn, minter, resolver)
@@ -686,7 +748,7 @@ func TestHandleConn_NoAKIDDenied(t *testing.T) {
 	minter := &fakeMinter{}
 	resolver := &fakeResolver{role: testRole}
 
-	err := handleConn(context.Background(), conn, allowlist(testAccount), minter, resolver, testCredInstance, true)
+	err := handleConn(context.Background(), conn, testHost, allowlist(testAccount), minter, resolver, testCredInstance, true)
 	require.NoError(t, err)
 
 	denied(t, conn, minter, resolver)
@@ -739,7 +801,7 @@ func TestFacetCoverage_ExampleRuleFields(t *testing.T) {
 				verdict:  pluginsdk.Verdict{Action: verdictDeny}, // deny: capture the facet, no mint
 			}
 
-			err := handleConn(context.Background(), conn, allowlist(testAccount), &fakeMinter{}, &fakeResolver{role: testRole}, testCredInstance, true)
+			err := handleConn(context.Background(), conn, s3Host, allowlist(testAccount), &fakeMinter{}, &fakeResolver{role: testRole}, testCredInstance, true)
 			must.NoError(err)
 			must.NotNil(conn.evalAction)
 

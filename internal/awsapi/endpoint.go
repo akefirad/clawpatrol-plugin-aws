@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -81,7 +82,7 @@ func Endpoint() pluginsdk.EndpointDef {
 			// 0001 D13): the gateway delivers no CredentialSecret. Thread the
 			// credential instance name so a would-be-served request can surface a
 			// recognizable re-auth error instead of failing at mint.
-			err = handleConn(ctx, conn, allow, minter, resolver, conn.CredentialInstance, token != "")
+			err = handleConn(ctx, conn, conn.UpstreamHost, allow, minter, resolver, conn.CredentialInstance, token != "")
 			if err != nil {
 				// The gateway closes the conn on a HandleConn error with no
 				// response to the agent, so without this the failure is silent
@@ -142,7 +143,7 @@ type roleResolver interface {
 // sso:GetRoleCredentials and cached per (account, role) by the minter (ADR
 // 0001 D12): a burst reuses one mint, and minting happens only after the
 // verdict allows the request.
-func handleConn(ctx context.Context, conn gatewayConn, allow map[string]struct{}, minter roleMinter, resolver roleResolver, credInstance string, hasToken bool) error {
+func handleConn(ctx context.Context, conn gatewayConn, upstreamHost string, allow map[string]struct{}, minter roleMinter, resolver roleResolver, credInstance string, hasToken bool) error {
 	br := bufio.NewReader(conn)
 	for {
 		req, err := http.ReadRequest(br)
@@ -154,7 +155,7 @@ func handleConn(ctx context.Context, conn gatewayConn, allow map[string]struct{}
 			return fmt.Errorf("read request: %w", err)
 		}
 
-		if err := handleRequest(ctx, conn, req, allow, minter, resolver, credInstance, hasToken); err != nil {
+		if err := handleRequest(ctx, conn, req, upstreamHost, allow, minter, resolver, credInstance, hasToken); err != nil {
 			return err
 		}
 
@@ -164,7 +165,7 @@ func handleConn(ctx context.Context, conn gatewayConn, allow map[string]struct{}
 	}
 }
 
-func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, allow map[string]struct{}, minter roleMinter, resolver roleResolver, credInstance string, hasToken bool) error {
+func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, upstreamHost string, allow map[string]struct{}, minter roleMinter, resolver roleResolver, credInstance string, hasToken bool) error {
 	// Acknowledge Expect: 100-continue before reading the body so an agent that
 	// waits for the go-ahead (S3 uploads do) streams it (ADR 0001 D12 write path).
 	if err := awssign.Ack100Continue(conn, req.Header); err != nil {
@@ -200,6 +201,17 @@ func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, all
 	// any policy evaluation, role resolution, or mint (ADR 0001 D4).
 	if _, allowed := allow[account]; !allowed {
 		return writeError(conn, req, "aws_api: account "+account+" is not on the allowlist")
+	}
+
+	// Fail closed when the agent-controlled Host header diverges from the host the
+	// gateway routed this connection to (S2): the routed host is the endpoint's
+	// policy-scoping key, and the facet service/region, the dial target, and the
+	// TLS SNI below are all derived from req.Host. Without this an agent could
+	// reach an SNI-scoped endpoint and address a different service via Host — a
+	// confused-deputy escape — so a mismatch is answered before any SSO work.
+	if !hostMatchesRoute(req.Host, upstreamHost) {
+		return writeErrorResponse(conn, req, http.StatusMisdirectedRequest,
+			"aws_api: request Host does not match the routed endpoint host")
 	}
 
 	host := req.Host
@@ -351,16 +363,26 @@ func forwardRequest(ctx context.Context, conn gatewayConn, req *http.Request, bo
 }
 
 // writeError sends a minimal 403 back to the agent for a denied or malformed
-// request. Richer, recognizable re-auth errors (ADR 0001 D13) are a later slice.
+// request (the AKID/account/allowlist gates and the D13 re-auth deny).
 func writeError(conn io.Writer, req *http.Request, reason string) error {
+	return writeErrorResponse(conn, req, http.StatusForbidden, reason)
+}
+
+// writeErrorResponse writes a minimal, bounded HTTP error back to the agent — a
+// real status code with the reason line as the only body — instead of tearing
+// the connection down with no response. It is the single path every non-success
+// outcome routes through (the deny/malformed 403s, the Host/SNI-divergence 421,
+// the body-cap 413, and the mint/dial 5xx), so the body is never unbounded and
+// nothing beyond the operator/plugin reason is echoed to the agent.
+func writeErrorResponse(conn io.Writer, req *http.Request, statusCode int, reason string) error {
 	if reason == "" {
 		reason = "aws_api: request denied"
 	}
 
 	body := []byte(reason + "\n")
 	resp := &http.Response{
-		Status:        "403 Forbidden",
-		StatusCode:    http.StatusForbidden,
+		Status:        fmt.Sprintf("%d %s", statusCode, http.StatusText(statusCode)),
+		StatusCode:    statusCode,
 		Proto:         "HTTP/1.1",
 		ProtoMajor:    1,
 		ProtoMinor:    1,
@@ -372,4 +394,31 @@ func writeError(conn io.Writer, req *http.Request, reason string) error {
 	}
 
 	return resp.Write(conn)
+}
+
+// hostMatchesRoute reports whether the agent-controlled HTTP Host header
+// addresses the same host the gateway routed this connection to
+// (conn.UpstreamHost, recovered from SNI / the VIP table before TLS
+// termination). The gateway scopes the endpoint's policy by that routed host, so
+// an agent that reached an s3.amazonaws.com endpoint must not then address
+// dynamodb.amazonaws.com via the Host header — a confused-deputy escape of the
+// endpoint's scope. When the routed host is unavailable (an older gateway that
+// does not send it, or a direct-IP dispatch with no SNI to compare) there is
+// nothing to check against and the request proceeds; the plugin's
+// *.amazonaws.com:443 egress capability remains the backstop.
+func hostMatchesRoute(reqHost, routedHost string) bool {
+	if routedHost == "" {
+		return true
+	}
+
+	return strings.EqualFold(hostOnly(reqHost), hostOnly(routedHost))
+}
+
+// hostOnly strips any :port suffix, returning the bare host for comparison.
+func hostOnly(hostport string) string {
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		return h
+	}
+
+	return hostport
 }
