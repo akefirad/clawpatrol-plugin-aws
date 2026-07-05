@@ -30,6 +30,14 @@ const EndpointTypeName = "aws_api"
 // credentials fall inside this window of their expiration.
 const credentialExpiryWindow = 5 * time.Minute
 
+// ssoMintTimeout bounds the single sso:GetRoleCredentials mint on the
+// forward path. The mint runs on the request's context, which carries no
+// deadline of its own, so a hung or mid-response-stalled SSO portal (the
+// default retryer only makes that worse) would otherwise wedge the request
+// for as long as the agent holds the connection. Mirror of the core
+// credential's ssoMintTimeout.
+const ssoMintTimeout = 15 * time.Second
+
 // maxRequestBodyBytes bounds how much of an agent request body the plugin reads
 // into memory. The re-sign hashes the whole payload, so the body is necessarily
 // buffered; without a cap an agent could stream an unbounded body and exhaust
@@ -453,7 +461,11 @@ func (h *connHandler) forwardRequest(ctx context.Context, p forwardParams) error
 		return fmt.Errorf("resolve role for account %s: %w", p.account, err)
 	}
 
-	creds, err := h.minter.Credentials(ctx, p.account, role)
+	// Bound the mint (the only unbounded upstream hop on this path); the
+	// re-sign and presign below are local computation.
+	mintCtx, cancel := context.WithTimeout(ctx, ssoMintTimeout)
+	creds, err := h.minter.Credentials(mintCtx, p.account, role)
+	cancel()
 	if err != nil {
 		_ = writeErrorResponse(conn, req, http.StatusBadGateway, "aws_api: could not mint credentials for the request")
 
