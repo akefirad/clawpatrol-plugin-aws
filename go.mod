@@ -6,7 +6,7 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.41.7
 	github.com/aws/aws-sdk-go-v2/service/sso v1.30.17
 	github.com/denoland/clawpatrol v0.5.3
-	github.com/stretchr/testify v1.7.2
+	github.com/stretchr/testify v1.11.1
 )
 
 require (
