@@ -30,6 +30,15 @@ const EndpointTypeName = "aws_api"
 // credentials fall inside this window of their expiration.
 const credentialExpiryWindow = 5 * time.Minute
 
+// maxRequestBodyBytes bounds how much of an agent request body the plugin reads
+// into memory. The re-sign hashes the whole payload, so the body is necessarily
+// buffered; without a cap an agent could stream an unbounded body and exhaust
+// the plugin's memory. 100 MiB comfortably covers ordinary API calls and a
+// single S3 (multipart) part while bounding the per-connection footprint; a
+// request over it is rejected with a 413. Tune here if larger single-PUT uploads
+// through the gateway become a real need.
+const maxRequestBodyBytes int64 = 100 << 20 // 100 MiB
+
 // gatewayConn is the slice of *pluginsdk.Conn that handleConn needs: the
 // duplex agent connection plus the gateway's Evaluate and brokered DialUpstream
 // hooks. Narrowing to an interface lets the handler be driven by a fake in
@@ -82,7 +91,7 @@ func Endpoint() pluginsdk.EndpointDef {
 			// 0001 D13): the gateway delivers no CredentialSecret. Thread the
 			// credential instance name so a would-be-served request can surface a
 			// recognizable re-auth error instead of failing at mint.
-			err = handleConn(ctx, conn, conn.UpstreamHost, allow, minter, resolver, conn.CredentialInstance, token != "")
+			err = handleConn(ctx, conn, conn.UpstreamHost, maxRequestBodyBytes, allow, minter, resolver, conn.CredentialInstance, token != "")
 			if err != nil {
 				// The gateway closes the conn on a HandleConn error with no
 				// response to the agent, so without this the failure is silent
@@ -143,7 +152,7 @@ type roleResolver interface {
 // sso:GetRoleCredentials and cached per (account, role) by the minter (ADR
 // 0001 D12): a burst reuses one mint, and minting happens only after the
 // verdict allows the request.
-func handleConn(ctx context.Context, conn gatewayConn, upstreamHost string, allow map[string]struct{}, minter roleMinter, resolver roleResolver, credInstance string, hasToken bool) error {
+func handleConn(ctx context.Context, conn gatewayConn, upstreamHost string, maxBody int64, allow map[string]struct{}, minter roleMinter, resolver roleResolver, credInstance string, hasToken bool) error {
 	br := bufio.NewReader(conn)
 	for {
 		req, err := http.ReadRequest(br)
@@ -155,28 +164,37 @@ func handleConn(ctx context.Context, conn gatewayConn, upstreamHost string, allo
 			return fmt.Errorf("read request: %w", err)
 		}
 
-		if err := handleRequest(ctx, conn, req, upstreamHost, allow, minter, resolver, credInstance, hasToken); err != nil {
+		closeConn, err := handleRequest(ctx, conn, req, upstreamHost, maxBody, allow, minter, resolver, credInstance, hasToken)
+		if err != nil {
 			return err
 		}
 
-		if req.Close {
+		if closeConn {
 			return nil
 		}
 	}
 }
 
-func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, upstreamHost string, allow map[string]struct{}, minter roleMinter, resolver roleResolver, credInstance string, hasToken bool) error {
-	// Acknowledge Expect: 100-continue before reading the body so an agent that
-	// waits for the go-ahead (S3 uploads do) streams it (ADR 0001 D12 write path).
+// readBoundedBody acknowledges Expect: 100-continue, reads the request body
+// bounded to maxBody bytes, and normalizes an aws-chunked body to its raw
+// payload. It returns tooLarge=true when the body exceeds the cap so the caller
+// answers a bounded 413. The ack and read run only after the fail-closed gates,
+// so a denied request is never invited to stream its payload; io.LimitReader
+// caps memory at maxBody+1 even if the agent ignores the ack and streams more.
+func readBoundedBody(conn io.Writer, req *http.Request, maxBody int64) (body []byte, tooLarge bool, err error) {
 	if err := awssign.Ack100Continue(conn, req.Header); err != nil {
-		return fmt.Errorf("ack 100-continue: %w", err)
+		return nil, false, fmt.Errorf("ack 100-continue: %w", err)
 	}
 
-	body, err := io.ReadAll(req.Body)
+	body, err = io.ReadAll(io.LimitReader(req.Body, maxBody+1))
 	_ = req.Body.Close()
 
 	if err != nil {
-		return fmt.Errorf("read request body: %w", err)
+		return nil, false, fmt.Errorf("read request body: %w", err)
+	}
+
+	if int64(len(body)) > maxBody {
+		return nil, true, nil
 	}
 
 	// Decode aws-chunked upload bodies to the raw payload and drop the framing /
@@ -184,23 +202,38 @@ func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, ups
 	// fail SignatureDoesNotMatch. A non-chunked body passes through unchanged.
 	body, err = awssign.NormalizeChunked(req, body)
 	if err != nil {
-		return fmt.Errorf("normalize request body: %w", err)
+		return nil, false, fmt.Errorf("normalize request body: %w", err)
 	}
 
+	return body, false, nil
+}
+
+// handleRequest processes one request. It returns closeConn=true when the
+// connection must not be reused: either the agent asked (req.Close), or the
+// request was answered before its body was drained (the fail-closed gates and
+// the over-cap guard skip the body, so the undrained bytes make the stream
+// unsafe to parse the next request from).
+func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, upstreamHost string, maxBody int64, allow map[string]struct{}, minter roleMinter, resolver roleResolver, credInstance string, hasToken bool) (closeConn bool, err error) {
+	// The fail-closed authorization gates run on the request line and headers
+	// alone, before Expect: 100-continue is acknowledged and before the body is
+	// read (S3): a request that will be denied here must never be invited to
+	// stream its payload nor have it buffered. These denials skip the body, so
+	// its bytes are left undrained and the connection is closed (closeConn=true)
+	// rather than reused.
 	akid, ok := awssign.CredentialAKID(req.Header.Get("Authorization"))
 	if !ok {
-		return writeError(conn, req, "aws_api: request is not SigV4-signed")
+		return true, writeError(conn, req, "aws_api: request is not SigV4-signed")
 	}
 
 	account, ok := awssign.AccountFromAKID(akid)
 	if !ok {
-		return writeError(conn, req, "aws_api: no account encoded in the access-key id")
+		return true, writeError(conn, req, "aws_api: no account encoded in the access-key id")
 	}
 
 	// Fail closed: an account outside the explicit allowlist is denied before
 	// any policy evaluation, role resolution, or mint (ADR 0001 D4).
 	if _, allowed := allow[account]; !allowed {
-		return writeError(conn, req, "aws_api: account "+account+" is not on the allowlist")
+		return true, writeError(conn, req, "aws_api: account "+account+" is not on the allowlist")
 	}
 
 	// Fail closed when the agent-controlled Host header diverges from the host the
@@ -210,8 +243,21 @@ func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, ups
 	// reach an SNI-scoped endpoint and address a different service via Host — a
 	// confused-deputy escape — so a mismatch is answered before any SSO work.
 	if !hostMatchesRoute(req.Host, upstreamHost) {
-		return writeErrorResponse(conn, req, http.StatusMisdirectedRequest,
+		return true, writeErrorResponse(conn, req, http.StatusMisdirectedRequest,
 			"aws_api: request Host does not match the routed endpoint host")
+	}
+
+	// The request is authorized to reach AWS: only now invite and read the body
+	// (bounded), so a denied request is never asked to stream its payload.
+	body, tooLarge, err := readBoundedBody(conn, req, maxBody)
+	if err != nil {
+		return false, err
+	}
+
+	if tooLarge {
+		// The over-cap remainder is left undrained, so the connection is closed.
+		return true, writeErrorResponse(conn, req, http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("aws_api: request body exceeds the %d-byte limit", maxBody))
 	}
 
 	host := req.Host
@@ -237,7 +283,7 @@ func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, ups
 
 	verdict, err := conn.Evaluate(ctx, FacetName, facet, summary)
 	if err != nil {
-		return fmt.Errorf("evaluate %s: %w", summary, err)
+		return false, fmt.Errorf("evaluate %s: %w", summary, err)
 	}
 
 	// Synchronous HITL (ADR 0001 request flow): Evaluate walks the approve chain
@@ -249,8 +295,10 @@ func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, ups
 	case verdictAllow, verdictHITLAllow:
 		// proceed
 	default:
-		// deny, hitl_deny, error, or any unrecognized action: fail closed.
-		return writeError(conn, req, "aws_api: "+verdict.Reason)
+		// deny, hitl_deny, error, or any unrecognized action: fail closed. The
+		// body was read above, so the stream is drained and the connection may be
+		// reused unless the agent asked to close it.
+		return req.Close, writeError(conn, req, "aws_api: "+verdict.Reason)
 	}
 
 	// The verdict would let this request through, but the SSO session expired with
@@ -273,16 +321,16 @@ func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, ups
 			Facets:  facet,
 		})
 
-		return writeError(conn, req, reason)
+		return req.Close, writeError(conn, req, reason)
 	}
 
 	if err := forwardRequest(ctx, conn, req, body, account, host, service, region, minter, resolver); err != nil {
 		// Tag the error with the account and host so the HandleConn log names the
 		// failing request (the underlying wraps already carry the SSO/dial detail).
-		return fmt.Errorf("forward request for account %s to %s: %w", account, host, err)
+		return false, fmt.Errorf("forward request for account %s to %s: %w", account, host, err)
 	}
 
-	return nil
+	return req.Close, nil
 }
 
 // reauthReason is the recognizable re-auth error surfaced to the agent when the

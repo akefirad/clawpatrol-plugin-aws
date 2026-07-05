@@ -40,6 +40,10 @@ const (
 
 	mintedAKID  = "ASIAMINTEDCREDS00001"
 	mintedToken = "minted-session-token"
+
+	// testMaxBody is a request-body cap generous enough that the tiny test bodies
+	// never trip it; the over-cap guard is exercised with its own small cap.
+	testMaxBody = 1 << 20 // 1 MiB
 )
 
 // allowlist builds the fail-closed account allowlist handleConn dispatches on.
@@ -238,7 +242,7 @@ func TestHandleConn_AllowedAccountMintsAndReSigns(t *testing.T) {
 	}
 	resolver := &fakeResolver{role: testRole}
 
-	err := handleConn(context.Background(), conn, testHost, allowlist(testAccount), mock.minter(), resolver, testCredInstance, true)
+	err := handleConn(context.Background(), conn, testHost, testMaxBody, allowlist(testAccount), mock.minter(), resolver, testCredInstance, true)
 	must.NoError(err)
 
 	// The account on the allowlist resolved its role and proceeded.
@@ -331,7 +335,7 @@ func TestHandleConn_S3PutObjectChunkedReSigns(t *testing.T) {
 	}
 	resolver := &fakeResolver{role: testRole}
 
-	err := handleConn(context.Background(), conn, s3Host, allowlist(testAccount), mock.minter(), resolver, testCredInstance, true)
+	err := handleConn(context.Background(), conn, s3Host, testMaxBody, allowlist(testAccount), mock.minter(), resolver, testCredInstance, true)
 	must.NoError(err)
 
 	// The enriched facet reached Evaluate with the reconstructed S3 op.
@@ -390,7 +394,7 @@ func TestHandleConn_HITLAllowProceeds(t *testing.T) {
 	}
 	resolver := &fakeResolver{role: testRole}
 
-	err := handleConn(context.Background(), conn, testHost, allowlist(testAccount), mock.minter(), resolver, testCredInstance, true)
+	err := handleConn(context.Background(), conn, testHost, testMaxBody, allowlist(testAccount), mock.minter(), resolver, testCredInstance, true)
 	must.NoError(err)
 
 	// The approved request resolved its role, minted fresh, and dialed upstream.
@@ -430,7 +434,7 @@ func TestHandleConn_HostMatchesRoute(t *testing.T) {
 		resolver := &fakeResolver{role: testRole}
 
 		// The routed host equals the request Host, so the request proceeds and dials.
-		err := handleConn(context.Background(), conn, testHost, allowlist(testAccount), mock.minter(), resolver, testCredInstance, true)
+		err := handleConn(context.Background(), conn, testHost, testMaxBody, allowlist(testAccount), mock.minter(), resolver, testCredInstance, true)
 		must.NoError(err)
 
 		is.Equal(1, resolver.calls)
@@ -441,31 +445,24 @@ func TestHandleConn_HostMatchesRoute(t *testing.T) {
 		t.Parallel()
 
 		is := assert.New(t)
-		must := require.New(t)
 
 		conn := &fakeConn{
 			incoming: bytes.NewReader([]byte(rawRequest(testPlaceholderAKID))), // Host: sts...
 			verdict:  pluginsdk.Verdict{Action: verdictAllow},                  // an allow must not save it
 		}
-		minter := &fakeMinter{}
-		resolver := &fakeResolver{role: testRole}
 
 		// The gateway routed this connection to a different host than the agent's
 		// Host header addresses — a confused-deputy attempt.
 		const routedHost = "dynamodb.us-east-1.amazonaws.com"
 
-		err := handleConn(context.Background(), conn, routedHost, allowlist(testAccount), minter, resolver, testCredInstance, true)
-		must.NoError(err)
+		minter, resolver := runFailClosed(t, conn, routedHost, testMaxBody)
 
 		status, body := agentResponse(t, conn)
 		is.Equal(http.StatusMisdirectedRequest, status)
 		is.Contains(string(body), "does not match the routed endpoint host")
 
 		// Failed closed before evaluating policy or doing any SSO work.
-		is.Equal(0, conn.evalCalls, "a misrouted request must not be evaluated")
-		is.Equal(0, resolver.calls)
-		is.Equal(0, minter.calls)
-		is.Empty(conn.dialAddr)
+		assertNoSSOWork(t, conn, minter, resolver)
 	})
 }
 
@@ -486,7 +483,7 @@ func TestHandleConn_DenyVerdictsBlock(t *testing.T) {
 			minter := &fakeMinter{}
 			resolver := &fakeResolver{role: testRole}
 
-			err := handleConn(context.Background(), conn, testHost, allowlist(testAccount), minter, resolver, testCredInstance, true)
+			err := handleConn(context.Background(), conn, testHost, testMaxBody, allowlist(testAccount), minter, resolver, testCredInstance, true)
 			require.NoError(t, err)
 
 			// The account is on the allowlist, so it was evaluated — but the
@@ -495,6 +492,65 @@ func TestHandleConn_DenyVerdictsBlock(t *testing.T) {
 			denied(t, conn, minter, resolver)
 		})
 	}
+}
+
+// TestHandleConn_OverCapBodyRejected proves the S3 body-size guard: a request
+// body larger than the cap is rejected with a bounded 413 before the facet is
+// evaluated or any SSO work happens; the io.LimitReader bounds memory regardless
+// of how much the agent streams.
+func TestHandleConn_OverCapBodyRejected(t *testing.T) {
+	t.Parallel()
+
+	is := assert.New(t)
+
+	conn := &fakeConn{
+		incoming: bytes.NewReader([]byte(rawRequest(testPlaceholderAKID))), // testBody exceeds tinyCap
+		verdict:  pluginsdk.Verdict{Action: verdictAllow},
+	}
+
+	const tinyCap = 8
+
+	minter, resolver := runFailClosed(t, conn, testHost, tinyCap)
+
+	status, body := agentResponse(t, conn)
+	is.Equal(http.StatusRequestEntityTooLarge, status)
+	is.Contains(string(body), "exceeds")
+
+	// Rejected before evaluating the facet or doing any SSO work.
+	assertNoSSOWork(t, conn, minter, resolver)
+}
+
+// TestHandleConn_DeniedRequestDoesNotInviteBody proves the S3 reorder: a request
+// denied at a fail-closed gate (here the allowlist) is answered before the body
+// is invited or read — the Expect: 100-continue is never acknowledged, so an
+// agent holding back an upload never streams it, and no SSO work happens.
+func TestHandleConn_DeniedRequestDoesNotInviteBody(t *testing.T) {
+	t.Parallel()
+
+	is := assert.New(t)
+	must := require.New(t)
+
+	const s3Host = "s3.us-east-1.amazonaws.com"
+
+	// An S3 PutObject with Expect: 100-continue whose decoded account is not on
+	// the allowlist.
+	conn := &fakeConn{
+		incoming: bytes.NewReader([]byte(rawChunkedPut(s3Host, testPlaceholderAKID, []byte("payload")))),
+		verdict:  pluginsdk.Verdict{Action: verdictAllow}, // an allow must not save it
+	}
+	minter := &fakeMinter{}
+	resolver := &fakeResolver{role: testRole}
+
+	err := handleConn(context.Background(), conn, s3Host, testMaxBody, allowlist("999999999999"), minter, resolver, testCredInstance, true)
+	must.NoError(err)
+
+	// Denied with a 403, and the 100-continue go-ahead was never sent — the agent
+	// was never invited to stream the payload.
+	status, _ := agentResponse(t, conn)
+	is.Equal(http.StatusForbidden, status)
+	is.NotContains(conn.toAgent.String(), "100 Continue", "a denied request must not ack 100-continue")
+
+	assertNoSSOWork(t, conn, minter, resolver)
 }
 
 // TestHandleConn_ExpiredSessionSurfacesReauth proves ADR 0001 D13: when the
@@ -517,7 +573,7 @@ func TestHandleConn_ExpiredSessionSurfacesReauth(t *testing.T) {
 
 	// hasToken=false models the empty CredentialSecret the gateway delivers on an
 	// expired session.
-	err := handleConn(context.Background(), conn, testHost, allowlist(testAccount), minter, resolver, testCredInstance, false)
+	err := handleConn(context.Background(), conn, testHost, testMaxBody, allowlist(testAccount), minter, resolver, testCredInstance, false)
 	must.NoError(err)
 
 	// Denied with a recognizable re-auth error naming the credential — no SSO work.
@@ -552,7 +608,7 @@ func TestHandleConn_ExpiredSessionEmitsAuditEvent(t *testing.T) {
 		verdict:  pluginsdk.Verdict{Action: verdictAllow},
 	}
 
-	err := handleConn(context.Background(), conn, testHost, allowlist(testAccount), &fakeMinter{}, &fakeResolver{role: testRole}, testCredInstance, false)
+	err := handleConn(context.Background(), conn, testHost, testMaxBody, allowlist(testAccount), &fakeMinter{}, &fakeResolver{role: testRole}, testCredInstance, false)
 	must.NoError(err)
 
 	// Exactly one supplementary audit event for the denied-for-reauth request.
@@ -581,7 +637,7 @@ func runAllowed(t *testing.T, rawResponse string) *fakeConn {
 		upstream: &fakeUpstream{response: bytes.NewReader([]byte(rawResponse))},
 	}
 
-	err := handleConn(context.Background(), conn, testHost, allowlist(testAccount), mock.minter(), &fakeResolver{role: testRole}, testCredInstance, true)
+	err := handleConn(context.Background(), conn, testHost, testMaxBody, allowlist(testAccount), mock.minter(), &fakeResolver{role: testRole}, testCredInstance, true)
 	require.NoError(t, err)
 
 	return conn
@@ -693,12 +749,41 @@ func TestReportResponse_SetResultFailureIsBestEffort(t *testing.T) {
 
 	// A SetResult failure must not fail the request — the agent already has its
 	// response.
-	err := handleConn(context.Background(), conn, testHost, allowlist(testAccount), mock.minter(), &fakeResolver{role: testRole}, testCredInstance, true)
+	err := handleConn(context.Background(), conn, testHost, testMaxBody, allowlist(testAccount), mock.minter(), &fakeResolver{role: testRole}, testCredInstance, true)
 	must.NoError(err)
 
 	_, body := agentResponse(t, conn)
 	is.Equal(payload, string(body))
 	is.Equal(1, conn.resultCalls)
+}
+
+// runFailClosed drives conn (already carrying its incoming request and verdict)
+// through handleConn for an on-allowlist account with a live token, so the only
+// thing under test is a fail-closed guard. It returns the minter/resolver stubs
+// for a follow-up assertNoSSOWork.
+func runFailClosed(t *testing.T, conn *fakeConn, upstreamHost string, maxBody int64) (*fakeMinter, *fakeResolver) {
+	t.Helper()
+
+	minter := &fakeMinter{}
+	resolver := &fakeResolver{role: testRole}
+
+	err := handleConn(context.Background(), conn, upstreamHost, maxBody, allowlist(testAccount), minter, resolver, testCredInstance, true)
+	require.NoError(t, err)
+
+	return minter, resolver
+}
+
+// assertNoSSOWork asserts a fail-closed outcome did no SSO work: the request was
+// not evaluated, no role was resolved, no credentials were minted, and nothing
+// was dialed upstream.
+func assertNoSSOWork(t *testing.T, conn *fakeConn, minter *fakeMinter, resolver *fakeResolver) {
+	t.Helper()
+
+	is := assert.New(t)
+	is.Equal(0, conn.evalCalls, "must not evaluate a fail-closed request")
+	is.Equal(0, resolver.calls, "must not resolve a role")
+	is.Equal(0, minter.calls, "must not mint credentials")
+	is.Empty(conn.dialAddr, "must not dial upstream")
 }
 
 // denied asserts a fail-closed outcome: a 403 to the agent, and no role
@@ -732,7 +817,7 @@ func TestHandleConn_UnknownAccountDenied(t *testing.T) {
 	resolver := &fakeResolver{role: testRole}
 
 	// testAccount is not on the allowlist.
-	err := handleConn(context.Background(), conn, testHost, allowlist("999999999999"), minter, resolver, testCredInstance, true)
+	err := handleConn(context.Background(), conn, testHost, testMaxBody, allowlist("999999999999"), minter, resolver, testCredInstance, true)
 	require.NoError(t, err)
 
 	denied(t, conn, minter, resolver)
@@ -748,7 +833,7 @@ func TestHandleConn_NoAKIDDenied(t *testing.T) {
 	minter := &fakeMinter{}
 	resolver := &fakeResolver{role: testRole}
 
-	err := handleConn(context.Background(), conn, testHost, allowlist(testAccount), minter, resolver, testCredInstance, true)
+	err := handleConn(context.Background(), conn, testHost, testMaxBody, allowlist(testAccount), minter, resolver, testCredInstance, true)
 	require.NoError(t, err)
 
 	denied(t, conn, minter, resolver)
@@ -801,7 +886,7 @@ func TestFacetCoverage_ExampleRuleFields(t *testing.T) {
 				verdict:  pluginsdk.Verdict{Action: verdictDeny}, // deny: capture the facet, no mint
 			}
 
-			err := handleConn(context.Background(), conn, s3Host, allowlist(testAccount), &fakeMinter{}, &fakeResolver{role: testRole}, testCredInstance, true)
+			err := handleConn(context.Background(), conn, s3Host, testMaxBody, allowlist(testAccount), &fakeMinter{}, &fakeResolver{role: testRole}, testCredInstance, true)
 			must.NoError(err)
 			must.NotNil(conn.evalAction)
 
