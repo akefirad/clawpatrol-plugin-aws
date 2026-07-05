@@ -75,10 +75,54 @@ func TestAction_JSONProtocolTarget(t *testing.T) {
 	t.Parallel()
 
 	req := newRequest(t, http.MethodPost, "dynamodb.us-east-1.amazonaws.com", "/", map[string]string{
+		"Content-Type": "application/x-amz-json-1.0",
 		"X-Amz-Target": "DynamoDB_20120810.PutItem",
 	})
 
 	assert.Equal(t, "PutItem", Action(req, nil, "dynamodb"))
+}
+
+// A JSON-protocol request must be classified from X-Amz-Target (the field AWS
+// executes), ignoring a decoy ?Action= in the URL an agent adds to make a write
+// look like a read.
+func TestAction_JSONProtocolIgnoresQueryActionDecoy(t *testing.T) {
+	t.Parallel()
+
+	req := newRequest(t, http.MethodPost, "dynamodb.us-east-1.amazonaws.com", "/?Action=GetItem", map[string]string{
+		"Content-Type": "application/x-amz-json-1.0",
+		"X-Amz-Target": "DynamoDB_20120810.DeleteItem",
+	})
+
+	assert.Equal(t, "DeleteItem", Action(req, nil, "dynamodb"))
+}
+
+// A query-protocol POST must be classified from the form-body Action (the field
+// AWS executes), ignoring a spoofed X-Amz-Target header that would otherwise
+// mask the real mutation as a read.
+func TestAction_QueryProtocolIgnoresSpoofedTarget(t *testing.T) {
+	t.Parallel()
+
+	body := []byte("Action=TerminateInstances&InstanceId.1=i-0&Version=2016-11-15")
+	req := newRequest(t, http.MethodPost, "ec2.eu-central-1.amazonaws.com", "/", map[string]string{
+		"Content-Type": "application/x-www-form-urlencoded",
+		"X-Amz-Target": "x.DescribeInstances",
+	})
+
+	assert.Equal(t, "TerminateInstances", Action(req, body, "ec2"))
+}
+
+// A query-protocol POST must be classified from the form-body Action, ignoring a
+// decoy ?Action= in the URL (AWS resolves the operation from the body it is
+// sent, not the query string).
+func TestAction_QueryProtocolIgnoresQueryActionDecoy(t *testing.T) {
+	t.Parallel()
+
+	body := []byte("Action=TerminateInstances&InstanceId.1=i-0&Version=2016-11-15")
+	req := newRequest(t, http.MethodPost, "ec2.eu-central-1.amazonaws.com", "/?Action=DescribeInstances", map[string]string{
+		"Content-Type": "application/x-www-form-urlencoded",
+	})
+
+	assert.Equal(t, "TerminateInstances", Action(req, body, "ec2"))
 }
 
 func TestAction_QueryProtocolFormAction(t *testing.T) {
