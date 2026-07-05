@@ -18,9 +18,9 @@ import (
 // only ever narrows within the account boundary — the account allowlist itself
 // is never discovered (ADR 0001 D4). Safe for concurrent use.
 type Roles struct {
-	region    string
 	token     string
 	newClient ssoClientFunc
+	client    *sso.Client // built once in NewRoles; region is fixed per instance
 
 	mu    sync.Mutex
 	cache map[string]string // account -> resolved role
@@ -42,7 +42,6 @@ func WithRolesClientFunc(fn ssoClientFunc) RolesOption {
 // network of its own (ADR 0001 Capabilities).
 func NewRoles(region, token string, dial DialFunc, opts ...RolesOption) *Roles {
 	r := &Roles{
-		region:    region,
 		token:     token,
 		newClient: func(rg string) *sso.Client { return newSSOClient(rg, dial) },
 		cache:     make(map[string]string),
@@ -51,6 +50,11 @@ func NewRoles(region, token string, dial DialFunc, opts ...RolesOption) *Roles {
 	for _, opt := range opts {
 		opt(r)
 	}
+
+	// Build the SSO client once: the region is fixed for the instance and
+	// sso.Client (with its brokered transport) is safe for concurrent reuse, so
+	// there is no need to rebuild it per discovery.
+	r.client = r.newClient(region)
 
 	return r
 }
@@ -79,15 +83,13 @@ func (r *Roles) Role(ctx context.Context, account string) (string, error) {
 // discover lists every role the SSO session grants on the account (following
 // pagination) and enforces the single-role rule.
 func (r *Roles) discover(ctx context.Context, account string) (string, error) {
-	client := r.newClient(r.region)
-
 	var (
 		roles []string
 		next  *string
 	)
 
 	for {
-		out, err := client.ListAccountRoles(ctx, &sso.ListAccountRolesInput{
+		out, err := r.client.ListAccountRoles(ctx, &sso.ListAccountRolesInput{
 			AccessToken: aws.String(r.token),
 			AccountId:   aws.String(account),
 			NextToken:   next,

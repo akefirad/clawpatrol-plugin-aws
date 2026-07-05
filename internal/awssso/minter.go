@@ -37,10 +37,10 @@ type cacheKey struct {
 // holds the SSO access token (delivered as Conn.CredentialSecret) and a cache
 // per (account, role). Safe for concurrent use.
 type Minter struct {
-	region       string
 	token        string
 	expiryWindow time.Duration
 	newClient    ssoClientFunc
+	client       *sso.Client // built once in New; region is fixed per instance
 
 	mu     sync.Mutex
 	caches map[cacheKey]*aws.CredentialsCache
@@ -63,7 +63,6 @@ func WithClientFunc(fn ssoClientFunc) Option {
 // of its own (ADR 0001 Capabilities).
 func New(region, token string, expiryWindow time.Duration, dial DialFunc, opts ...Option) *Minter {
 	m := &Minter{
-		region:       region,
 		token:        token,
 		expiryWindow: expiryWindow,
 		newClient:    func(r string) *sso.Client { return newSSOClient(r, dial) },
@@ -73,6 +72,12 @@ func New(region, token string, expiryWindow time.Duration, dial DialFunc, opts .
 	for _, opt := range opts {
 		opt(m)
 	}
+
+	// Build the SSO client once: the region is fixed for the instance and
+	// sso.Client (with its brokered transport) is safe for concurrent reuse, so
+	// there is no need to rebuild it — and re-resolve its options/retryer — on
+	// every mint.
+	m.client = m.newClient(region)
 
 	return m
 }
@@ -104,11 +109,10 @@ func (m *Minter) cacheFor(account, role string) *aws.CredentialsCache {
 	}
 
 	provider := &roleProvider{
-		newClient: m.newClient,
-		region:    m.region,
-		token:     m.token,
-		account:   account,
-		role:      role,
+		client:  m.client,
+		token:   m.token,
+		account: account,
+		role:    role,
 	}
 	cache := aws.NewCredentialsCache(provider, func(o *aws.CredentialsCacheOptions) {
 		o.ExpiryWindow = m.expiryWindow
@@ -122,18 +126,15 @@ func (m *Minter) cacheFor(account, role string) *aws.CredentialsCache {
 // credentials via sso:GetRoleCredentials. The enclosing aws.CredentialsCache
 // owns caching, the expiry window, and single-flight refresh.
 type roleProvider struct {
-	newClient ssoClientFunc
-	region    string
-	token     string
-	account   string
-	role      string
+	client  *sso.Client
+	token   string
+	account string
+	role    string
 }
 
 // Retrieve mints fresh credentials from the SSO portal.
 func (p *roleProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
-	client := p.newClient(p.region)
-
-	out, err := client.GetRoleCredentials(ctx, &sso.GetRoleCredentialsInput{
+	out, err := p.client.GetRoleCredentials(ctx, &sso.GetRoleCredentialsInput{
 		AccessToken: aws.String(p.token),
 		AccountId:   aws.String(p.account),
 		RoleName:    aws.String(p.role),
