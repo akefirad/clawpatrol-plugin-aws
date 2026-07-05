@@ -365,19 +365,35 @@ const connEventError = "error"
 // gateway's brokered dial. It runs only after the verdict allows, so a denied
 // request never resolves a role or mints (ADR 0001 request flow). The role is
 // cached per account and the minter caches per (account, role).
+//
+// Every failure that happens before the upstream response starts streaming to
+// the agent (role resolution — including the "account grants multiple roles"
+// misconfig — minting, re-signing, the dial, and the upstream write/read) is
+// answered with a bounded 5xx (S4) so the agent sees a real error status rather
+// than a bare connection reset; the wrapped error is still returned so
+// HandleConn logs the SSO/dial detail. The agent-facing reasons stay generic —
+// the diagnostic detail belongs in the operator's log, not a possibly
+// compromised agent. A reportResponse failure happens mid-stream, once the
+// agent is already receiving bytes, so no clean 5xx can replace it.
 func forwardRequest(ctx context.Context, conn gatewayConn, req *http.Request, body []byte, account, host, service, region string, minter roleMinter, resolver roleResolver) error {
 	role, err := resolver.Role(ctx, account)
 	if err != nil {
+		_ = writeErrorResponse(conn, req, http.StatusBadGateway, "aws_api: could not resolve a role for the target account")
+
 		return fmt.Errorf("resolve role for account %s: %w", account, err)
 	}
 
 	creds, err := minter.Credentials(ctx, account, role)
 	if err != nil {
+		_ = writeErrorResponse(conn, req, http.StatusBadGateway, "aws_api: could not mint credentials for the request")
+
 		return fmt.Errorf("mint credentials: %w", err)
 	}
 
 	signed, err := awssign.SignRequest(ctx, req, host, body, service, region, creds)
 	if err != nil {
+		_ = writeErrorResponse(conn, req, http.StatusBadGateway, "aws_api: could not sign the request")
+
 		return fmt.Errorf("re-sign: %w", err)
 	}
 
@@ -386,16 +402,22 @@ func forwardRequest(ctx context.Context, conn gatewayConn, req *http.Request, bo
 		TLSServerName: host,
 	})
 	if err != nil {
+		_ = writeErrorResponse(conn, req, http.StatusBadGateway, "aws_api: could not reach the upstream service")
+
 		return fmt.Errorf("dial upstream %s: %w", host, err)
 	}
 	defer func() { _ = upstream.Close() }()
 
 	if err := signed.Write(upstream); err != nil {
+		_ = writeErrorResponse(conn, req, http.StatusBadGateway, "aws_api: could not send the request upstream")
+
 		return fmt.Errorf("write upstream request: %w", err)
 	}
 
 	resp, err := http.ReadResponse(bufio.NewReader(upstream), signed)
 	if err != nil {
+		_ = writeErrorResponse(conn, req, http.StatusBadGateway, "aws_api: no valid response from the upstream service")
+
 		return fmt.Errorf("read upstream response: %w", err)
 	}
 

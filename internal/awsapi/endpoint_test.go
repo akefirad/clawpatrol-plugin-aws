@@ -60,23 +60,25 @@ func allowlist(accounts ...string) map[string]struct{} {
 // lookups so a denied request can prove no role was ever resolved.
 type fakeResolver struct {
 	role  string
+	err   error // when set, Role fails (e.g. the multiple-roles misconfig)
 	calls int
 }
 
 func (r *fakeResolver) Role(_ context.Context, _ string) (string, error) {
 	r.calls++
-	return r.role, nil
+	return r.role, r.err
 }
 
 // fakeMinter is a roleMinter stub recording its calls so a denied request can
 // prove no credentials were minted.
 type fakeMinter struct {
+	err   error // when set, Credentials fails (e.g. GetRoleCredentials error)
 	calls int
 }
 
 func (m *fakeMinter) Credentials(_ context.Context, _, _ string) (aws.Credentials, error) {
 	m.calls++
-	return aws.Credentials{AccessKeyID: "SHOULD-NOT-BE-USED"}, nil
+	return aws.Credentials{AccessKeyID: "SHOULD-NOT-BE-USED"}, m.err
 }
 
 // fakeUpstream is the net.Conn returned by the fake DialUpstream: it captures
@@ -755,6 +757,63 @@ func TestReportResponse_SetResultFailureIsBestEffort(t *testing.T) {
 	_, body := agentResponse(t, conn)
 	is.Equal(payload, string(body))
 	is.Equal(1, conn.resultCalls)
+}
+
+// runForwardFailure drives an allowed on-allowlist request through handleConn
+// with the given (failing) minter/resolver and asserts HandleConn surfaced the
+// error to log (S4). It returns the fakeConn so the caller can assert the
+// bounded 5xx the agent received in place of a bare connection reset.
+func runForwardFailure(t *testing.T, minter *fakeMinter, resolver *fakeResolver) *fakeConn {
+	t.Helper()
+
+	conn := &fakeConn{
+		incoming: bytes.NewReader([]byte(rawRequest(testPlaceholderAKID))),
+		verdict:  pluginsdk.Verdict{Action: verdictAllow},
+	}
+
+	err := handleConn(context.Background(), conn, testHost, testMaxBody, allowlist(testAccount), minter, resolver, testCredInstance, true)
+	require.Error(t, err)
+
+	return conn
+}
+
+// TestForwardRequest_ResolveFailureWrites5xx proves S4: when role resolution
+// fails (e.g. the account grants multiple roles — a misconfig, ADR 0001 D3), the
+// agent gets a bounded 502 instead of a bare connection reset, and nothing is
+// minted or dialed.
+func TestForwardRequest_ResolveFailureWrites5xx(t *testing.T) {
+	t.Parallel()
+
+	is := assert.New(t)
+
+	minter := &fakeMinter{}
+	resolver := &fakeResolver{err: errors.New("account 123456789012 grants multiple roles")}
+
+	conn := runForwardFailure(t, minter, resolver)
+
+	status, _ := agentResponse(t, conn)
+	is.Equal(http.StatusBadGateway, status)
+	is.Equal(1, resolver.calls)
+	is.Equal(0, minter.calls, "a resolve failure must not mint")
+	is.Empty(conn.dialAddr)
+}
+
+// TestForwardRequest_MintFailureWrites5xx proves S4: when minting fails the
+// agent gets a bounded 502 rather than a bare reset, and nothing is dialed.
+func TestForwardRequest_MintFailureWrites5xx(t *testing.T) {
+	t.Parallel()
+
+	is := assert.New(t)
+
+	minter := &fakeMinter{err: errors.New("GetRoleCredentials failed")}
+	resolver := &fakeResolver{role: testRole}
+
+	conn := runForwardFailure(t, minter, resolver)
+
+	status, _ := agentResponse(t, conn)
+	is.Equal(http.StatusBadGateway, status)
+	is.Equal(1, minter.calls)
+	is.Empty(conn.dialAddr, "a mint failure must not dial")
 }
 
 // runFailClosed drives conn (already carrying its incoming request and verdict)
