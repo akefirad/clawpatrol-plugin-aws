@@ -104,7 +104,17 @@ func DecodeChunked(body []byte) ([]byte, error) {
 			return out, nil
 		}
 
-		if int64(i)+size > int64(len(body)) {
+		// ParseInt accepts a leading '-', so reject a negative size explicitly:
+		// otherwise body[i:i+int(size)] below slices with a negative bound and
+		// panics, tearing down the connection on attacker-controlled input.
+		if size < 0 {
+			return nil, fmt.Errorf("negative aws-chunked chunk size %d", size)
+		}
+
+		// Overflow-safe remaining-length check: i+size can wrap past the end for a
+		// huge size (e.g. 7fffffffffffffff) and slip past a `i+size > len` guard,
+		// then panic at the slice. Compare against the remaining bytes instead.
+		if size > int64(len(body)-i) {
 			return nil, fmt.Errorf("aws-chunked chunk size %d exceeds remaining body %d", size, len(body)-i)
 		}
 

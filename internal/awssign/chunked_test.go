@@ -122,6 +122,32 @@ func TestDecodeChunked_MissingInterChunkCRLF(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestDecodeChunked_RejectsMalformedSizeWithoutPanic(t *testing.T) {
+	t.Parallel()
+
+	// Attacker-controlled chunk sizes that used to slip past the bounds check and
+	// panic at the slice (a per-connection DoS): a negative size, and a size so
+	// large that i+size wraps negative. Both must be a clean error, never a panic.
+	cases := []struct {
+		name string
+		body string
+	}{
+		{name: "negative size", body: "-1\r\ndata\r\n"},
+		{name: "overflowing size", body: "7fffffffffffffff\r\ndata\r\n"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			require.NotPanics(t, func() {
+				_, err := DecodeChunked([]byte(tc.body))
+				assert.Error(t, err)
+			})
+		})
+	}
+}
+
 func TestNormalizeChunked_DecodesAndStripsHeaders(t *testing.T) {
 	t.Parallel()
 
