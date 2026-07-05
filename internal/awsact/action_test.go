@@ -15,9 +15,11 @@ const (
 	s3BucketPath = "/bucket"
 )
 
-// headerContentType is the request header the action classifier reads the wire
-// protocol from.
-const headerContentType = "Content-Type"
+// Request headers the action classifier reads.
+const (
+	headerContentType = "Content-Type"
+	headerAmzTarget   = "X-Amz-Target"
+)
 
 // newRequest builds a request the way handleConn hands one to the parser:
 // method, an absolute URL (so req.URL carries the path + raw query), and a
@@ -103,7 +105,7 @@ func TestAction_JSONProtocolTarget(t *testing.T) {
 
 	req := newRequest(t, http.MethodPost, "dynamodb.us-east-1.amazonaws.com", "/", map[string]string{
 		headerContentType: "application/x-amz-json-1.0",
-		"X-Amz-Target":    "DynamoDB_20120810.PutItem",
+		headerAmzTarget:   "DynamoDB_20120810.PutItem",
 	})
 
 	assert.Equal(t, "PutItem", Action(req, nil, "dynamodb"))
@@ -117,7 +119,7 @@ func TestAction_JSONProtocolIgnoresQueryActionDecoy(t *testing.T) {
 
 	req := newRequest(t, http.MethodPost, "dynamodb.us-east-1.amazonaws.com", "/?Action=GetItem", map[string]string{
 		headerContentType: "application/x-amz-json-1.0",
-		"X-Amz-Target":    "DynamoDB_20120810.DeleteItem",
+		headerAmzTarget:   "DynamoDB_20120810.DeleteItem",
 	})
 
 	assert.Equal(t, "DeleteItem", Action(req, nil, "dynamodb"))
@@ -132,7 +134,7 @@ func TestAction_QueryProtocolIgnoresSpoofedTarget(t *testing.T) {
 	body := []byte("Action=TerminateInstances&InstanceId.1=i-0&Version=2016-11-15")
 	req := newRequest(t, http.MethodPost, "ec2.eu-central-1.amazonaws.com", "/", map[string]string{
 		headerContentType: "application/x-www-form-urlencoded",
-		"X-Amz-Target":    "x.DescribeInstances",
+		headerAmzTarget:   "x.DescribeInstances",
 	})
 
 	assert.Equal(t, "TerminateInstances", Action(req, body, "ec2"))
@@ -150,6 +152,59 @@ func TestAction_QueryProtocolIgnoresQueryActionDecoy(t *testing.T) {
 	})
 
 	assert.Equal(t, "TerminateInstances", Action(req, body, "ec2"))
+}
+
+// The protocol is chosen from the service, not the agent-supplied Content-Type:
+// a query-protocol service (EC2) with a JSON Content-Type + spoofed X-Amz-Target
+// is still classified from its form-body Action, so the write isn't masked.
+func TestAction_QueryServiceIgnoresJSONContentTypeSpoof(t *testing.T) {
+	t.Parallel()
+
+	body := []byte("Action=TerminateInstances&InstanceId.1=i-0&Version=2016-11-15")
+	req := newRequest(t, http.MethodPost, "ec2.eu-central-1.amazonaws.com", "/", map[string]string{
+		headerContentType: "application/x-amz-json-1.0",
+		headerAmzTarget:   "x.DescribeInstances",
+	})
+
+	assert.Equal(t, "TerminateInstances", Action(req, body, "ec2"))
+}
+
+// Symmetric: a JSON-protocol service (DynamoDB) with a form Content-Type + a
+// decoy body/URL Action is still classified from X-Amz-Target.
+func TestAction_JSONServiceIgnoresFormContentTypeSpoof(t *testing.T) {
+	t.Parallel()
+
+	body := []byte("Action=GetItem&Version=2012-08-10")
+	req := newRequest(t, http.MethodPost, "dynamodb.us-east-1.amazonaws.com", "/", map[string]string{
+		headerContentType: "application/x-www-form-urlencoded",
+		headerAmzTarget:   "DynamoDB_20120810.DeleteItem",
+	})
+
+	assert.Equal(t, "DeleteItem", Action(req, body, "dynamodb"))
+}
+
+// An unknown service whose X-Amz-Target and Action parameter disagree is
+// ambiguous (the dispatch field is unknown), so it fails closed to the mutation
+// fallback rather than guessing a read.
+func TestAction_UnknownServiceConflictFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	req := newRequest(t, http.MethodGet, "newsvc.eu-central-1.amazonaws.com", "/?Action=DescribeThings", map[string]string{
+		"X-Amz-Target": "New.DeleteThing",
+	})
+
+	assert.Equal(t, "GET /", Action(req, nil, "newsvc"))
+}
+
+// An unknown service carrying a single dispatch field is resolved best-effort.
+func TestAction_UnknownServiceSingleFieldBestEffort(t *testing.T) {
+	t.Parallel()
+
+	req := newRequest(t, http.MethodPost, "newsvc.eu-central-1.amazonaws.com", "/", map[string]string{
+		"X-Amz-Target": "New.DescribeThings",
+	})
+
+	assert.Equal(t, "DescribeThings", Action(req, nil, "newsvc"))
 }
 
 func TestAction_QueryProtocolFormAction(t *testing.T) {

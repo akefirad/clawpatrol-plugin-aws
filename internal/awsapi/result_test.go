@@ -23,6 +23,7 @@ func TestResponseCarriesSecret(t *testing.T) {
 		want    bool
 	}{
 		{serviceSecretsManager, "GetSecretValue", true},
+		{serviceSecretsManager, "BatchGetSecretValue", true},
 		{serviceSecretsManager, "DescribeSecret", false},
 		{serviceSSM, "GetParameter", true},
 		{serviceSSM, "GetParameters", true},
@@ -32,6 +33,15 @@ func TestResponseCarriesSecret(t *testing.T) {
 		{serviceSTS, "AssumeRoleWithWebIdentity", true},
 		{serviceSTS, "GetSessionToken", true},
 		{serviceSTS, "GetCallerIdentity", false},
+		{serviceECR, "GetAuthorizationToken", true},
+		{serviceECR, "DescribeRepositories", false},
+		{serviceCognitoID, "GetCredentialsForIdentity", true},
+		{serviceCognitoID, "GetId", false},
+		{serviceRedshift, "GetClusterCredentials", true},
+		{serviceRedshift, "GetClusterCredentialsWithIAM", true},
+		{serviceRedshift, "DescribeClusters", false},
+		{serviceLightsail, "GetInstanceAccessDetails", true},
+		{serviceLightsail, "GetInstances", false},
 		{"s3", "GetObject", false},
 		{"dynamodb", "GetItem", false},
 	}
