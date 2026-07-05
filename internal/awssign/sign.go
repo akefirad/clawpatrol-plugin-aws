@@ -61,7 +61,14 @@ func SignRequest(
 	payloadHash := hex.EncodeToString(sum[:])
 	out.Header.Set("X-Amz-Content-Sha256", payloadHash)
 
-	signer := v4.NewSigner()
+	// S3 is the one service that must not re-escape the canonical URI path (the
+	// AWS S3 client sets DisableURIPathEscaping too): a key like "my file+name.txt"
+	// would otherwise be double-encoded ("my%2520file…"), which S3's
+	// canonicalization won't match -> SignatureDoesNotMatch. Every other service
+	// keeps the default single escaping.
+	signer := v4.NewSigner(func(o *v4.SignerOptions) {
+		o.DisableURIPathEscaping = service == "s3"
+	})
 	if err := signer.SignHTTP(ctx, creds, out, payloadHash, service, region, time.Now().UTC()); err != nil {
 		return nil, fmt.Errorf("sigv4 sign %s/%s: %w", service, region, err)
 	}

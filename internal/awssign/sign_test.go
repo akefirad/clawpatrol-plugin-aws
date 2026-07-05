@@ -1,13 +1,19 @@
 package awssign_test
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -84,6 +90,90 @@ func TestSignRequest_ReplacesPlaceholderWithSeededIdentity(t *testing.T) {
 	// Upstream request targets the AWS host, not the agent's placeholder URL.
 	is.Equal(host, out.Host)
 	is.Empty(out.RequestURI)
+}
+
+// TestSignRequest_S3DisablesURIPathDoubleEscaping proves S3 requests are signed
+// without re-escaping the canonical URI path. It signs an S3 key holding
+// characters the SDK's default escaping would double-encode and compares against
+// an independent SigV4 signing of the identical request with default escaping ON
+// (at the exact timestamp SignRequest used, so only the escaping differs): the
+// signatures must diverge for the special-char key, and match for an
+// unreserved-char key (the control that proves the divergence is the escaping,
+// not the harness).
+func TestSignRequest_S3DisablesURIPathDoubleEscaping(t *testing.T) {
+	t.Parallel()
+
+	is := assert.New(t)
+	must := require.New(t)
+
+	const (
+		host   = "bucket.s3.us-east-1.amazonaws.com"
+		region = "us-east-1"
+	)
+
+	seeded := aws.Credentials{
+		AccessKeyID:     "ASIASEEDEDCREDS12345",
+		SecretAccessKey: "seededsecretaccesskey0000000000000000000",
+		SessionToken:    "SEEDED-SESSION-TOKEN",
+	}
+
+	// sign returns (SignRequest's S3 signature, an independent default-escaping
+	// signature of the same request) for an object key.
+	sign := func(key string) (s3Sig, defaultSig string) {
+		body := []byte("data")
+
+		out, err := awssign.SignRequest(context.Background(), s3PutRequest(t, host, key), host, body, "s3", region, seeded)
+		must.NoError(err)
+
+		tm, err := time.Parse("20060102T150405Z", out.Header.Get("X-Amz-Date"))
+		must.NoError(err)
+
+		// Mirror SignRequest's request prep, then sign with the SDK default (path
+		// escaping ON) at the same timestamp.
+		ref := s3PutRequest(t, host, key)
+		ref.URL.Scheme = "https"
+		ref.URL.Host = host
+		ref.Host = host
+		ref.Body = io.NopCloser(bytes.NewReader(body))
+		ref.ContentLength = int64(len(body))
+
+		sum := sha256.Sum256(body)
+		payloadHash := hex.EncodeToString(sum[:])
+		ref.Header.Set("X-Amz-Content-Sha256", payloadHash)
+
+		must.NoError(v4.NewSigner().SignHTTP(context.Background(), seeded, ref, payloadHash, "s3", region, tm))
+
+		return signatureOf(out.Header.Get("Authorization")), signatureOf(ref.Header.Get("Authorization"))
+	}
+
+	s3Sig, defSig := sign("/bucket/my file+name.txt")
+	is.NotEqual(defSig, s3Sig, "S3 must sign without re-escaping the path (else SignatureDoesNotMatch)")
+
+	plainS3, plainDef := sign("/bucket/plainkey.txt")
+	is.Equal(plainDef, plainS3, "an unreserved-char key escapes to itself either way")
+}
+
+// s3PutRequest builds a placeholder-signed S3 PUT for key, setting the path
+// directly so a space/reserved character survives into req.URL.Path.
+func s3PutRequest(t *testing.T, host, key string) *http.Request {
+	t.Helper()
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPut, "https://"+host+"/", strings.NewReader(""))
+	req.URL.Path = key
+	req.URL.RawPath = ""
+	req.Host = host
+
+	return req
+}
+
+// signatureOf extracts the hex Signature from a SigV4 Authorization header.
+func signatureOf(authz string) string {
+	const marker = "Signature="
+	if i := strings.LastIndex(authz, marker); i >= 0 {
+		return authz[i+len(marker):]
+	}
+
+	return ""
 }
 
 func TestSignRequest_EmptyBodyAndNoSessionToken(t *testing.T) {
