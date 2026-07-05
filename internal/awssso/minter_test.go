@@ -43,6 +43,8 @@ type roleCreds struct {
 type mockSSO struct {
 	server *httptest.Server
 
+	akid, secret, token string // returned material; defaults to the minted constants
+
 	mints       atomic.Int64
 	gotToken    atomic.Value // string
 	gotAccount  atomic.Value // string
@@ -54,7 +56,12 @@ type mockSSO struct {
 func newMockSSO(t *testing.T, expiration int64) *mockSSO {
 	t.Helper()
 
-	m := &mockSSO{expiration: expiration}
+	m := &mockSSO{
+		expiration: expiration,
+		akid:       mintedAKID,
+		secret:     mintedSecret,
+		token:      mintedToken,
+	}
 	m.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if m.releaseMint != nil {
 			<-m.releaseMint
@@ -67,9 +74,9 @@ func newMockSSO(t *testing.T, expiration int64) *mockSSO {
 
 		body, err := json.Marshal(map[string]roleCreds{
 			"roleCredentials": {
-				AccessKeyID:     mintedAKID,
-				SecretAccessKey: mintedSecret,
-				SessionToken:    mintedToken,
+				AccessKeyID:     m.akid,
+				SecretAccessKey: m.secret,
+				SessionToken:    m.token,
 				Expiration:      m.expiration,
 			},
 		})
@@ -212,6 +219,25 @@ func TestMinter_RejectsNonPositiveExpiration(t *testing.T) {
 		_, err := minter.Credentials(context.Background(), testAccount, testRole)
 		require.Error(t, err, "expiration %d must be rejected", exp)
 	}
+}
+
+func TestMinter_RejectsEmptyCredentialMaterial(t *testing.T) {
+	t.Parallel()
+
+	// A malformed-but-200 response: valid expiration, but empty key material.
+	m := newMockSSO(t, expiresIn(time.Hour))
+	m.akid = ""
+	m.secret = ""
+	minter := m.mint(testRegion, testToken, time.Minute)
+
+	_, err := minter.Credentials(context.Background(), testAccount, testRole)
+	require.Error(t, err, "empty credential material must be rejected")
+
+	// It must not be cached: a second call re-mints rather than serving the
+	// empty material until expiry.
+	_, err = minter.Credentials(context.Background(), testAccount, testRole)
+	require.Error(t, err)
+	assert.Equal(t, int64(2), m.mintCount(), "empty material must not be cached")
 }
 
 func TestMinter_RestartRepopulatesFromToken(t *testing.T) {
