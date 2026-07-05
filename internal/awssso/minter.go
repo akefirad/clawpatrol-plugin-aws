@@ -8,6 +8,13 @@
 // to a single mint (the cache single-flights). The caches are in-memory and
 // scoped to one Minter, so a process restart starts cold and repopulates from
 // the re-delivered token — no re-login.
+//
+// SYNC OBLIGATION: this is one of two intentional copies of a
+// security-sensitive minter. The other is the core credential's copy at
+// clawpatrol (internal/config/plugins/credentials/aws_sso_minter.go). They
+// are not shared code, and nothing forces them to stay in sync. Any hardening
+// to the mint/retrieve path (e.g. fail-closed validation of the SSO response)
+// MUST be mirrored in the sibling copy, and vice versa.
 package awssso
 
 import (
@@ -154,10 +161,23 @@ func (p *roleProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
 		return aws.Credentials{}, fmt.Errorf("sso GetRoleCredentials: non-positive expiration %d", rc.Expiration)
 	}
 
+	// Fail closed on empty credential material: a malformed-but-200 response
+	// (roleCredentials present, valid expiration, but empty key material —
+	// aws.ToString(nil) → "") would otherwise be cached until expiry, signing
+	// every request with empty keys with no re-mint until the window opens.
+	// SSO role credentials are always session credentials, so all three must
+	// be non-empty. Mirror of the core credential's minter.
+	akid := aws.ToString(rc.AccessKeyId)
+	secret := aws.ToString(rc.SecretAccessKey)
+	sessionToken := aws.ToString(rc.SessionToken)
+	if akid == "" || secret == "" || sessionToken == "" {
+		return aws.Credentials{}, errors.New("sso GetRoleCredentials: empty credential material (missing access key, secret, or session token)")
+	}
+
 	return aws.Credentials{
-		AccessKeyID:     aws.ToString(rc.AccessKeyId),
-		SecretAccessKey: aws.ToString(rc.SecretAccessKey),
-		SessionToken:    aws.ToString(rc.SessionToken),
+		AccessKeyID:     akid,
+		SecretAccessKey: secret,
+		SessionToken:    sessionToken,
 		Source:          "aws_sso GetRoleCredentials",
 		AccountID:       p.account,
 		CanExpire:       true,
