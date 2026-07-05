@@ -46,6 +46,15 @@ dispatch) but differ in the **minting** half (`GetRoleCredentials` vs
 The credential type is `aws_sso_credential`. One SSO authentication (`start_url` + SSO
 `region` → one device login → one stored token) serves many accounts.
 
+The type name takes the `_credential` suffix to match the convention for
+bare-service credential stems (`aws_credential`, `google_gke_credential`,
+`postgres_credential`) and to read consistently with the AWS family
+(`aws_credential` / `aws_sso_credential` / `aws_sso_eks_credential`). Note this is
+distinct from the OAuth **Flow** identifier, which stays `aws_sso`: the flow is the
+shared device-login mechanism the gateway-fork core dispatches on (`Flow ==
+"aws_sso"`), reused by the in-tree `aws_sso_eks_credential` — renaming the type does
+not touch it.
+
 ### D2 — The account is the sole per-request dispatch key; role is fixed config
 
 A bot never *chooses* a role per request. Exposing a role choice would push a

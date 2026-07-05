@@ -1,5 +1,5 @@
 // Package plugin assembles the clawpatrol plugin declaration for the AWS SSO
-// gateway: the aws_sso credential, the aws_api endpoint, and the aws facet.
+// gateway: the aws_sso_credential credential, the aws_api endpoint, and the aws facet.
 package plugin
 
 import (
