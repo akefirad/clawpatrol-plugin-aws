@@ -111,10 +111,14 @@ func DecodeChunked(body []byte) ([]byte, error) {
 		out = append(out, body[i:i+int(size)]...)
 		i += int(size)
 
-		// Skip the CRLF that terminates the chunk data.
-		if i+2 <= len(body) && body[i] == '\r' && body[i+1] == '\n' {
-			i += 2
+		// Every data chunk is terminated by CRLF. Require it: silently tolerating a
+		// missing terminator would reinterpret the following bytes as the next
+		// chunk header, decoding a corrupt payload instead of failing.
+		if i+2 > len(body) || body[i] != '\r' || body[i+1] != '\n' {
+			return nil, errors.New("malformed aws-chunked body: missing CRLF after chunk data")
 		}
+
+		i += 2
 	}
 }
 

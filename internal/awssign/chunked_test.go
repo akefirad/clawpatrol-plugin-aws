@@ -108,6 +108,20 @@ func TestDecodeChunked_Malformed(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestDecodeChunked_MissingInterChunkCRLF(t *testing.T) {
+	t.Parallel()
+
+	// A data chunk not terminated by CRLF: "hello" runs straight into the "0"
+	// zero-chunk header. Without the CRLF check this is silently reinterpreted as
+	// the next chunk header, decoding a corrupt payload; it must be an error.
+	body := "5;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n" +
+		"hello" + // no trailing CRLF
+		"0\r\n\r\n"
+
+	_, err := DecodeChunked([]byte(body))
+	assert.Error(t, err)
+}
+
 func TestNormalizeChunked_DecodesAndStripsHeaders(t *testing.T) {
 	t.Parallel()
 
