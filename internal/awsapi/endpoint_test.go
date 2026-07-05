@@ -765,8 +765,10 @@ func TestReportResponse_SecretServiceBodyNotSampled(t *testing.T) {
 	is := assert.New(t)
 	must := require.New(t)
 
-	const host = "secretsmanager.us-east-1.amazonaws.com"
-	const secret = `{"SecretString":"super-secret-value"}`
+	const (
+		host   = "secretsmanager.us-east-1.amazonaws.com"
+		secret = "super-secret-value-plaintext"
+	)
 
 	// A Secrets Manager GetSecretValue: JSON protocol, so the op is carried in
 	// X-Amz-Target. The account is still decoded from the placeholder AKID.

@@ -126,18 +126,23 @@ func TestRoles_SlowDiscoveryDoesNotBlockCachedAccount(t *testing.T) {
 	m.block = make(chan struct{})
 
 	discovering := make(chan struct{})
+
 	go func() {
 		close(discovering)
+
 		_, _ = resolver.Role(context.Background(), otherAccount)
 	}()
+
 	<-discovering
 
 	// The blocked discovery must not hold the mutex: a cache hit for the
 	// already-resolved account has to return promptly, not wait behind it.
 	done := make(chan string, 1)
+
 	go func() {
 		role, roleErr := resolver.Role(context.Background(), testAccount)
-		require.NoError(t, roleErr)
+		assert.NoError(t, roleErr)
+
 		done <- role
 	}()
 

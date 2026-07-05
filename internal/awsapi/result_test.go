@@ -22,16 +22,16 @@ func TestResponseCarriesSecret(t *testing.T) {
 		action  string
 		want    bool
 	}{
-		{"secretsmanager", "GetSecretValue", true},
-		{"secretsmanager", "DescribeSecret", false},
-		{"ssm", "GetParameter", true},
-		{"ssm", "GetParameters", true},
-		{"ssm", "GetParametersByPath", true},
-		{"ssm", "DescribeParameters", false},
-		{"sts", "AssumeRole", true},
-		{"sts", "AssumeRoleWithWebIdentity", true},
-		{"sts", "GetSessionToken", true},
-		{"sts", "GetCallerIdentity", false},
+		{serviceSecretsManager, "GetSecretValue", true},
+		{serviceSecretsManager, "DescribeSecret", false},
+		{serviceSSM, "GetParameter", true},
+		{serviceSSM, "GetParameters", true},
+		{serviceSSM, "GetParametersByPath", true},
+		{serviceSSM, "DescribeParameters", false},
+		{serviceSTS, "AssumeRole", true},
+		{serviceSTS, "AssumeRoleWithWebIdentity", true},
+		{serviceSTS, "GetSessionToken", true},
+		{serviceSTS, "GetCallerIdentity", false},
 		{"s3", "GetObject", false},
 		{"dynamodb", "GetItem", false},
 	}

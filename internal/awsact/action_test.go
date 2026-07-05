@@ -15,6 +15,10 @@ const (
 	s3BucketPath = "/bucket"
 )
 
+// headerContentType is the request header the action classifier reads the wire
+// protocol from.
+const headerContentType = "Content-Type"
+
 // newRequest builds a request the way handleConn hands one to the parser:
 // method, an absolute URL (so req.URL carries the path + raw query), and a
 // host. headers is applied last.
@@ -98,8 +102,8 @@ func TestAction_JSONProtocolTarget(t *testing.T) {
 	t.Parallel()
 
 	req := newRequest(t, http.MethodPost, "dynamodb.us-east-1.amazonaws.com", "/", map[string]string{
-		"Content-Type": "application/x-amz-json-1.0",
-		"X-Amz-Target": "DynamoDB_20120810.PutItem",
+		headerContentType: "application/x-amz-json-1.0",
+		"X-Amz-Target":    "DynamoDB_20120810.PutItem",
 	})
 
 	assert.Equal(t, "PutItem", Action(req, nil, "dynamodb"))
@@ -112,8 +116,8 @@ func TestAction_JSONProtocolIgnoresQueryActionDecoy(t *testing.T) {
 	t.Parallel()
 
 	req := newRequest(t, http.MethodPost, "dynamodb.us-east-1.amazonaws.com", "/?Action=GetItem", map[string]string{
-		"Content-Type": "application/x-amz-json-1.0",
-		"X-Amz-Target": "DynamoDB_20120810.DeleteItem",
+		headerContentType: "application/x-amz-json-1.0",
+		"X-Amz-Target":    "DynamoDB_20120810.DeleteItem",
 	})
 
 	assert.Equal(t, "DeleteItem", Action(req, nil, "dynamodb"))
@@ -127,8 +131,8 @@ func TestAction_QueryProtocolIgnoresSpoofedTarget(t *testing.T) {
 
 	body := []byte("Action=TerminateInstances&InstanceId.1=i-0&Version=2016-11-15")
 	req := newRequest(t, http.MethodPost, "ec2.eu-central-1.amazonaws.com", "/", map[string]string{
-		"Content-Type": "application/x-www-form-urlencoded",
-		"X-Amz-Target": "x.DescribeInstances",
+		headerContentType: "application/x-www-form-urlencoded",
+		"X-Amz-Target":    "x.DescribeInstances",
 	})
 
 	assert.Equal(t, "TerminateInstances", Action(req, body, "ec2"))
@@ -142,7 +146,7 @@ func TestAction_QueryProtocolIgnoresQueryActionDecoy(t *testing.T) {
 
 	body := []byte("Action=TerminateInstances&InstanceId.1=i-0&Version=2016-11-15")
 	req := newRequest(t, http.MethodPost, "ec2.eu-central-1.amazonaws.com", "/?Action=DescribeInstances", map[string]string{
-		"Content-Type": "application/x-www-form-urlencoded",
+		headerContentType: "application/x-www-form-urlencoded",
 	})
 
 	assert.Equal(t, "TerminateInstances", Action(req, body, "ec2"))
@@ -153,7 +157,7 @@ func TestAction_QueryProtocolFormAction(t *testing.T) {
 
 	body := []byte("Action=DescribeInstances&Version=2016-11-15")
 	req := newRequest(t, http.MethodPost, "ec2.eu-central-1.amazonaws.com", "/", map[string]string{
-		"Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+		headerContentType: "application/x-www-form-urlencoded; charset=utf-8",
 	})
 
 	assert.Equal(t, "DescribeInstances", Action(req, body, "ec2"))

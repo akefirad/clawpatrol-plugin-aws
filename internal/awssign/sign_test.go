@@ -36,6 +36,9 @@ const (
 	placeholderToken = "PLACEHOLDER-SESSION-TOKEN"
 )
 
+// seededSecret is the secret access key of the seeded identity re-signs use.
+const seededSecret = "seededsecretaccesskey0000000000000000000"
+
 // incomingRequest fakes an agent request as it arrives at the endpoint:
 // placeholder-signed, with an X-Amz-Security-Token the re-sign must replace.
 func incomingRequest(t *testing.T, host, body string) *http.Request {
@@ -64,7 +67,7 @@ func TestSignRequest_ReplacesPlaceholderWithSeededIdentity(t *testing.T) {
 
 	seeded := aws.Credentials{
 		AccessKeyID:     "ASIASEEDEDCREDS12345",
-		SecretAccessKey: "seededsecretaccesskey0000000000000000000",
+		SecretAccessKey: seededSecret,
 		SessionToken:    "SEEDED-SESSION-TOKEN",
 	}
 
@@ -113,7 +116,7 @@ func TestSignRequest_S3DisablesURIPathDoubleEscaping(t *testing.T) {
 
 	seeded := aws.Credentials{
 		AccessKeyID:     "ASIASEEDEDCREDS12345",
-		SecretAccessKey: "seededsecretaccesskey0000000000000000000",
+		SecretAccessKey: seededSecret,
 		SessionToken:    "SEEDED-SESSION-TOKEN",
 	}
 
@@ -170,7 +173,7 @@ func TestSignRequest_ClearsChunkedTransferEncoding(t *testing.T) {
 
 	seeded := aws.Credentials{
 		AccessKeyID:     "ASIASEEDEDCREDS12345",
-		SecretAccessKey: "seededsecretaccesskey0000000000000000000",
+		SecretAccessKey: seededSecret,
 	}
 
 	out, err := awssign.SignRequest(context.Background(), req, host, []byte(stsBody), "sts", "us-east-1", seeded)
@@ -222,7 +225,7 @@ func TestSignRequest_EmptyBodyAndNoSessionToken(t *testing.T) {
 
 	seeded := aws.Credentials{
 		AccessKeyID:     "AKIASEEDEDLONGTERM01",
-		SecretAccessKey: "seededsecretaccesskey0000000000000000000",
+		SecretAccessKey: seededSecret,
 		// no SessionToken
 	}
 

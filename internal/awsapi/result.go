@@ -21,6 +21,13 @@ const (
 	resultFieldResponseBody = "response_body"
 )
 
+// Service names whose responses carry secrets/credentials (responseCarriesSecret).
+const (
+	serviceSecretsManager = "secretsmanager"
+	serviceSSM            = "ssm"
+	serviceSTS            = "sts"
+)
+
 // errorPeekCap bounds how much of an error response body the plugin reads to
 // extract the AWS error code. AWS error bodies (XML <Error> / JSON __type) are
 // small; the code sits at the front. The remainder streams to the agent
@@ -116,16 +123,16 @@ func reportResponse(ctx context.Context, conn resultConn, resp *http.Response, s
 // Manager DescribeSecret, …) are not excluded, so ordinary auditing is retained.
 func responseCarriesSecret(service, action string) bool {
 	switch service {
-	case "secretsmanager":
+	case serviceSecretsManager:
 		return action == "GetSecretValue"
-	case "ssm":
+	case serviceSSM:
 		// SSM parameter reads can return SecureString plaintext; the action alone
 		// does not reveal the type, so exclude all parameter fetches.
 		switch action {
 		case "GetParameter", "GetParameters", "GetParametersByPath":
 			return true
 		}
-	case "sts":
+	case serviceSTS:
 		switch action {
 		case "AssumeRole", "AssumeRoleWithSAML", "AssumeRoleWithWebIdentity",
 			"GetSessionToken", "GetFederationToken":
