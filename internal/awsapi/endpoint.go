@@ -91,6 +91,15 @@ func Endpoint() pluginsdk.EndpointDef {
 			// 0001 D13): the gateway delivers no CredentialSecret. Thread the
 			// credential instance name so a would-be-served request can surface a
 			// recognizable re-auth error instead of failing at mint.
+			//
+			// TODO: hasToken (token != "") is captured once, at connection open, and
+			// held for the connection's lifetime. A token that expires mid-connection
+			// is not re-observed here, so such a request skips the D13 re-auth surface
+			// and instead fails at mint — answered by the S4 bounded 5xx, not the
+			// recognizable re-auth error. This is acceptable because the gateway
+			// re-delivers the token as CredentialSecret per connection (ADR 0001 D9 /
+			// request flow), so the next connection re-reads it; revisit if a
+			// long-lived keep-alive connection makes mid-connection expiry common.
 			err = handleConn(ctx, conn, conn.UpstreamHost, maxRequestBodyBytes, allow, minter, resolver, conn.CredentialInstance, token != "")
 			if err != nil {
 				// The gateway closes the conn on a HandleConn error with no
