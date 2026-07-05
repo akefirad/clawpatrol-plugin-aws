@@ -307,6 +307,13 @@ func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, ups
 		// deny, hitl_deny, error, or any unrecognized action: fail closed. The
 		// body was read above, so the stream is drained and the connection may be
 		// reused unless the agent asked to close it.
+		//
+		// verdict.Reason is operator-authored rule text (the gateway does not fill
+		// it from agent input), so reflecting it verbatim to the agent is a
+		// conscious decision (m1): it is a useful, low-risk diagnostic that tells
+		// the agent why it was blocked, and surfacing operator text to a
+		// potentially-compromised agent leaks nothing the operator did not choose
+		// to write into the rule.
 		return req.Close, writeError(conn, req, "aws_api: "+verdict.Reason)
 	}
 
