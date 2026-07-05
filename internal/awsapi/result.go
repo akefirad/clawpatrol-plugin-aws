@@ -26,6 +26,10 @@ const (
 	serviceSecretsManager = "secretsmanager"
 	serviceSSM            = "ssm"
 	serviceSTS            = "sts"
+	serviceECR            = "ecr"
+	serviceCognitoID      = "cognito-identity"
+	serviceRedshift       = "redshift"
+	serviceLightsail      = "lightsail"
 )
 
 // errorPeekCap bounds how much of an error response body the plugin reads to
@@ -121,10 +125,17 @@ func reportResponse(ctx context.Context, conn resultConn, resp *http.Response, s
 // These operations return plaintext secrets or temporary credentials by
 // definition; sibling reads on the same service (STS GetCallerIdentity, Secrets
 // Manager DescribeSecret, …) are not excluded, so ordinary auditing is retained.
+//
+// This is a curated denylist and, by construction, lags AWS: it fails OPEN
+// (samples) for a secret-returning operation not listed here, so it must be
+// extended as such APIs are added or newly routed through the gateway. The
+// structural fix — sampling opt-in per rule (default off), so an unlisted secret
+// API fails closed — is a facet/rule-contract change tracked as a follow-up.
 func responseCarriesSecret(service, action string) bool {
 	switch service {
 	case serviceSecretsManager:
-		return action == "GetSecretValue"
+		// Both the single- and batch-fetch return the secret value.
+		return action == "GetSecretValue" || action == "BatchGetSecretValue"
 	case serviceSSM:
 		// SSM parameter reads can return SecureString plaintext; the action alone
 		// does not reveal the type, so exclude all parameter fetches.
@@ -138,6 +149,18 @@ func responseCarriesSecret(service, action string) bool {
 			"GetSessionToken", "GetFederationToken":
 			return true
 		}
+	case serviceECR:
+		// Returns a base64 registry auth token (docker login credentials).
+		return action == "GetAuthorizationToken"
+	case serviceCognitoID:
+		// Returns temporary AWS credentials for an identity.
+		return action == "GetCredentialsForIdentity"
+	case serviceRedshift:
+		// Returns temporary database credentials.
+		return action == "GetClusterCredentials" || action == "GetClusterCredentialsWithIAM"
+	case serviceLightsail:
+		// Returns SSH/RDP access credentials for an instance.
+		return action == "GetInstanceAccessDetails"
 	}
 
 	return false
