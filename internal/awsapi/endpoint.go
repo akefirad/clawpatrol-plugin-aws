@@ -149,6 +149,34 @@ type roleResolver interface {
 	Role(ctx context.Context, account string) (string, error)
 }
 
+// connHandler carries the connection-scoped dependencies and delivery inputs
+// every request on one agent connection shares (the conn, the routed host, the
+// body cap, the allowlist, the minter/resolver, and the credential's instance
+// name and token presence). Threading them as one receiver keeps the per-request
+// methods off a long, order-sensitive parameter list (m3).
+type connHandler struct {
+	conn         gatewayConn
+	upstreamHost string
+	maxBody      int64
+	allow        map[string]struct{}
+	minter       roleMinter
+	resolver     roleResolver
+	credInstance string
+	hasToken     bool
+}
+
+// forwardParams is the per-request input to forwarding: the request, its
+// already-read and chunk-normalized body, and the routing/signing attributes
+// derived from it (account, host, and the SigV4 service/region).
+type forwardParams struct {
+	req     *http.Request
+	body    []byte
+	account string
+	host    string
+	service string
+	region  string
+}
+
 // handleConn owns one agent connection: read each HTTP request, decode the
 // target account from the SigV4 access-key id, fail closed unless the account
 // is on the allowlist, evaluate the aws facet, resolve and mint short-lived
@@ -162,6 +190,17 @@ type roleResolver interface {
 // 0001 D12): a burst reuses one mint, and minting happens only after the
 // verdict allows the request.
 func handleConn(ctx context.Context, conn gatewayConn, upstreamHost string, maxBody int64, allow map[string]struct{}, minter roleMinter, resolver roleResolver, credInstance string, hasToken bool) error {
+	h := &connHandler{
+		conn:         conn,
+		upstreamHost: upstreamHost,
+		maxBody:      maxBody,
+		allow:        allow,
+		minter:       minter,
+		resolver:     resolver,
+		credInstance: credInstance,
+		hasToken:     hasToken,
+	}
+
 	br := bufio.NewReader(conn)
 	for {
 		req, err := http.ReadRequest(br)
@@ -173,7 +212,7 @@ func handleConn(ctx context.Context, conn gatewayConn, upstreamHost string, maxB
 			return fmt.Errorf("read request: %w", err)
 		}
 
-		closeConn, err := handleRequest(ctx, conn, req, upstreamHost, maxBody, allow, minter, resolver, credInstance, hasToken)
+		closeConn, err := h.handleRequest(ctx, req)
 		if err != nil {
 			return err
 		}
@@ -190,19 +229,19 @@ func handleConn(ctx context.Context, conn gatewayConn, upstreamHost string, maxB
 // answers a bounded 413. The ack and read run only after the fail-closed gates,
 // so a denied request is never invited to stream its payload; io.LimitReader
 // caps memory at maxBody+1 even if the agent ignores the ack and streams more.
-func readBoundedBody(conn io.Writer, req *http.Request, maxBody int64) (body []byte, tooLarge bool, err error) {
-	if err := awssign.Ack100Continue(conn, req.Header); err != nil {
+func (h *connHandler) readBoundedBody(req *http.Request) (body []byte, tooLarge bool, err error) {
+	if err := awssign.Ack100Continue(h.conn, req.Header); err != nil {
 		return nil, false, fmt.Errorf("ack 100-continue: %w", err)
 	}
 
-	body, err = io.ReadAll(io.LimitReader(req.Body, maxBody+1))
+	body, err = io.ReadAll(io.LimitReader(req.Body, h.maxBody+1))
 	_ = req.Body.Close()
 
 	if err != nil {
 		return nil, false, fmt.Errorf("read request body: %w", err)
 	}
 
-	if int64(len(body)) > maxBody {
+	if int64(len(body)) > h.maxBody {
 		return nil, true, nil
 	}
 
@@ -222,7 +261,9 @@ func readBoundedBody(conn io.Writer, req *http.Request, maxBody int64) (body []b
 // request was answered before its body was drained (the fail-closed gates and
 // the over-cap guard skip the body, so the undrained bytes make the stream
 // unsafe to parse the next request from).
-func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, upstreamHost string, maxBody int64, allow map[string]struct{}, minter roleMinter, resolver roleResolver, credInstance string, hasToken bool) (closeConn bool, err error) {
+func (h *connHandler) handleRequest(ctx context.Context, req *http.Request) (closeConn bool, err error) {
+	conn := h.conn
+
 	// The fail-closed authorization gates run on the request line and headers
 	// alone, before Expect: 100-continue is acknowledged and before the body is
 	// read (S3): a request that will be denied here must never be invited to
@@ -241,7 +282,7 @@ func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, ups
 
 	// Fail closed: an account outside the explicit allowlist is denied before
 	// any policy evaluation, role resolution, or mint (ADR 0001 D4).
-	if _, allowed := allow[account]; !allowed {
+	if _, allowed := h.allow[account]; !allowed {
 		return true, writeError(conn, req, "aws_api: account "+account+" is not on the allowlist")
 	}
 
@@ -251,14 +292,14 @@ func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, ups
 	// TLS SNI below are all derived from req.Host. Without this an agent could
 	// reach an SNI-scoped endpoint and address a different service via Host — a
 	// confused-deputy escape — so a mismatch is answered before any SSO work.
-	if !hostMatchesRoute(req.Host, upstreamHost) {
+	if !hostMatchesRoute(req.Host, h.upstreamHost) {
 		return true, writeErrorResponse(conn, req, http.StatusMisdirectedRequest,
 			"aws_api: request Host does not match the routed endpoint host")
 	}
 
 	// The request is authorized to reach AWS: only now invite and read the body
 	// (bounded), so a denied request is never asked to stream its payload.
-	body, tooLarge, err := readBoundedBody(conn, req, maxBody)
+	body, tooLarge, err := h.readBoundedBody(req)
 	if err != nil {
 		return false, err
 	}
@@ -266,7 +307,7 @@ func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, ups
 	if tooLarge {
 		// The over-cap remainder is left undrained, so the connection is closed.
 		return true, writeErrorResponse(conn, req, http.StatusRequestEntityTooLarge,
-			fmt.Sprintf("aws_api: request body exceeds the %d-byte limit", maxBody))
+			fmt.Sprintf("aws_api: request body exceeds the %d-byte limit", h.maxBody))
 	}
 
 	host := req.Host
@@ -322,8 +363,8 @@ func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, ups
 	// instead of failing opaquely at mint (ADR 0001 D13): deny with a recognizable
 	// error naming the credential. The token-needing step (role resolve + mint) is
 	// never reached, so no SSO work happens on this path.
-	if !hasToken {
-		reason := reauthReason(credInstance)
+	if !h.hasToken {
+		reason := reauthReason(h.credInstance)
 
 		// Supplementary activity-stream marker (ADR 0001 D13): the Connect card is
 		// the primary expiry signal, but an audit event makes the denied request
@@ -340,7 +381,14 @@ func handleRequest(ctx context.Context, conn gatewayConn, req *http.Request, ups
 		return req.Close, writeError(conn, req, reason)
 	}
 
-	if err := forwardRequest(ctx, conn, req, body, account, host, service, region, minter, resolver); err != nil {
+	if err := h.forwardRequest(ctx, forwardParams{
+		req:     req,
+		body:    body,
+		account: account,
+		host:    host,
+		service: service,
+		region:  region,
+	}); err != nil {
 		// Tag the error with the account and host so the HandleConn log names the
 		// failing request (the underlying wraps already carry the SSO/dial detail).
 		return false, fmt.Errorf("forward request for account %s to %s: %w", account, host, err)
@@ -391,36 +439,38 @@ const connEventError = "error"
 // the diagnostic detail belongs in the operator's log, not a possibly
 // compromised agent. A reportResponse failure happens mid-stream, once the
 // agent is already receiving bytes, so no clean 5xx can replace it.
-func forwardRequest(ctx context.Context, conn gatewayConn, req *http.Request, body []byte, account, host, service, region string, minter roleMinter, resolver roleResolver) error {
-	role, err := resolver.Role(ctx, account)
+func (h *connHandler) forwardRequest(ctx context.Context, p forwardParams) error {
+	conn, req := h.conn, p.req
+
+	role, err := h.resolver.Role(ctx, p.account)
 	if err != nil {
 		_ = writeErrorResponse(conn, req, http.StatusBadGateway, "aws_api: could not resolve a role for the target account")
 
-		return fmt.Errorf("resolve role for account %s: %w", account, err)
+		return fmt.Errorf("resolve role for account %s: %w", p.account, err)
 	}
 
-	creds, err := minter.Credentials(ctx, account, role)
+	creds, err := h.minter.Credentials(ctx, p.account, role)
 	if err != nil {
 		_ = writeErrorResponse(conn, req, http.StatusBadGateway, "aws_api: could not mint credentials for the request")
 
 		return fmt.Errorf("mint credentials: %w", err)
 	}
 
-	signed, err := awssign.SignRequest(ctx, req, host, body, service, region, creds)
+	signed, err := awssign.SignRequest(ctx, req, p.host, p.body, p.service, p.region, creds)
 	if err != nil {
 		_ = writeErrorResponse(conn, req, http.StatusBadGateway, "aws_api: could not sign the request")
 
 		return fmt.Errorf("re-sign: %w", err)
 	}
 
-	upstream, err := conn.DialUpstream(ctx, "tcp", net.JoinHostPort(host, upstreamPort), &pluginsdk.DialUpstreamOptions{
+	upstream, err := conn.DialUpstream(ctx, "tcp", net.JoinHostPort(p.host, upstreamPort), &pluginsdk.DialUpstreamOptions{
 		TLS:           true,
-		TLSServerName: host,
+		TLSServerName: p.host,
 	})
 	if err != nil {
 		_ = writeErrorResponse(conn, req, http.StatusBadGateway, "aws_api: could not reach the upstream service")
 
-		return fmt.Errorf("dial upstream %s: %w", host, err)
+		return fmt.Errorf("dial upstream %s: %w", p.host, err)
 	}
 	defer func() { _ = upstream.Close() }()
 
