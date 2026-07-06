@@ -34,7 +34,7 @@ const (
 	testRole            = "ReadOnly"
 	testSSORegion       = "eu-central-1"
 	testSSOToken        = "sso-access-token-xyz" // delivered as Conn.CredentialSecret
-	testCredInstance    = "prod-aws"             // the aws_sso credential instance name
+	testCredInstance    = "prod-aws"             // the aws_sso_credential instance name
 	testHost            = "sts.us-east-1.amazonaws.com"
 	testBody            = `{"Action":"GetCallerIdentity","Version":"2011-06-15"}`
 

@@ -11,7 +11,7 @@ import (
 
 const testStartURL = "https://acme.awsapps.com/start"
 
-// validCfg builds a well-formed aws_sso body varying only the account
+// validCfg builds a well-formed aws_sso_credential body varying only the account
 // allowlist, so tests exercise validateAccounts without repeating the boilerplate.
 func validCfg(accounts []string) map[string]any {
 	return map[string]any{

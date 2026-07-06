@@ -1,5 +1,5 @@
-// Package awsapi implements the AWS SSO plugin's building blocks: the aws_sso
-// credential (Connect-card wiring, no login code), the aws_api endpoint (SigV4
+// Package awsapi implements the AWS SSO plugin's building blocks: the
+// aws_sso_credential (Connect-card wiring, no login code), the aws_api endpoint (SigV4
 // re-sign + brokered proxy), and the minimal aws facet.
 package awsapi
 
@@ -13,7 +13,7 @@ import (
 // CredentialTypeName is the HCL credential type this plugin registers.
 const CredentialTypeName = "aws_sso_credential"
 
-// ssoConfig is the decoded aws_sso credential body.
+// ssoConfig is the decoded aws_sso_credential body.
 //
 // ADR 0001 D3: the per-account allowlist is a flat `accounts = list(string)`
 // of 12-digit account ids. The pluginsdk v0.5.3 schema (register.go
