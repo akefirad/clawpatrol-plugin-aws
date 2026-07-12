@@ -1,0 +1,186 @@
+// Package awssso mints short-lived AWS credentials for a single configured
+// role via sso:GetRoleCredentials, using the SSO access token the gateway
+// delivers as Conn.CredentialSecret, and caches them per (account, role).
+//
+// Each (account, role) is served by an aws.CredentialsCache wrapping a
+// provider that calls GetRoleCredentials: retrieval is lazy, refresh happens
+// only inside the configured ExpiryWindow, and a concurrent burst collapses
+// to a single mint (the cache single-flights). The caches are in-memory and
+// scoped to one Minter, so a process restart starts cold and repopulates from
+// the re-delivered token — no re-login.
+//
+// SYNC OBLIGATION: this is one of two intentional copies of a
+// security-sensitive minter. The other is the core credential's copy at
+// clawpatrol (internal/config/plugins/credentials/aws_sso_minter.go). They
+// are not shared code, and nothing forces them to stay in sync. Any hardening
+// to the mint/retrieve path (e.g. fail-closed validation of the SSO response)
+// MUST be mirrored in the sibling copy, and vice versa.
+package awssso
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/sso"
+)
+
+// ssoClientFunc builds an SSO client for a region. It is the overridable
+// sso-client seam: production defaults it to a brokered client (built from the
+// gateway dial threaded into New), tests point it at a mock server.
+type ssoClientFunc func(region string) *sso.Client
+
+// cacheKey identifies one credential cache: temporary credentials are minted
+// and cached per target account and role.
+type cacheKey struct {
+	account string
+	role    string
+}
+
+// Minter mints and caches temporary role credentials for one SSO session. It
+// holds the SSO access token (delivered as Conn.CredentialSecret) and a cache
+// per (account, role). Safe for concurrent use.
+type Minter struct {
+	token        string
+	expiryWindow time.Duration
+	newClient    ssoClientFunc
+	client       *sso.Client // built once in New; region is fixed per instance
+
+	mu     sync.Mutex
+	caches map[cacheKey]*aws.CredentialsCache
+}
+
+// Option customizes a Minter at construction.
+type Option func(*Minter)
+
+// WithClientFunc overrides the sso-client seam — the way a Minter builds its
+// SSO client. Production leaves it defaulted to the brokered client; tests pass
+// a factory pointed at a mock server.
+func WithClientFunc(fn ssoClientFunc) Option {
+	return func(m *Minter) { m.newClient = fn }
+}
+
+// New builds a Minter for the SSO region and access token, with expiryWindow
+// as the refresh margin applied to every cached credential. dial is the
+// gateway's brokered dial (pluginsdk.Conn.DialUpstream): the SSO client routes
+// every sso:GetRoleCredentials call through it, since the plugin has no network
+// of its own (ADR 0001 Capabilities).
+func New(region, token string, expiryWindow time.Duration, dial DialFunc, opts ...Option) *Minter {
+	m := &Minter{
+		token:        token,
+		expiryWindow: expiryWindow,
+		newClient:    func(r string) *sso.Client { return newSSOClient(r, dial) },
+		caches:       make(map[cacheKey]*aws.CredentialsCache),
+	}
+
+	for _, opt := range opts {
+		opt(m)
+	}
+
+	// Build the SSO client once: the region is fixed for the instance and
+	// sso.Client (with its brokered transport) is safe for concurrent reuse, so
+	// there is no need to rebuild it — and re-resolve its options/retryer — on
+	// every mint.
+	m.client = m.newClient(region)
+
+	return m
+}
+
+// Credentials returns temporary credentials for the account and role, minting
+// via sso:GetRoleCredentials on a cold or expired cache and serving the cached
+// value otherwise.
+func (m *Minter) Credentials(ctx context.Context, account, role string) (aws.Credentials, error) {
+	cache := m.cacheFor(account, role)
+
+	creds, err := cache.Retrieve(ctx)
+	if err != nil {
+		return aws.Credentials{}, fmt.Errorf("mint credentials for %s/%s: %w", account, role, err)
+	}
+
+	return creds, nil
+}
+
+// cacheFor returns the credential cache for (account, role), creating it on
+// first use.
+func (m *Minter) cacheFor(account, role string) *aws.CredentialsCache {
+	key := cacheKey{account: account, role: role}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if cache, ok := m.caches[key]; ok {
+		return cache
+	}
+
+	provider := &roleProvider{
+		client:  m.client,
+		token:   m.token,
+		account: account,
+		role:    role,
+	}
+	cache := aws.NewCredentialsCache(provider, func(o *aws.CredentialsCacheOptions) {
+		o.ExpiryWindow = m.expiryWindow
+	})
+	m.caches[key] = cache
+
+	return cache
+}
+
+// roleProvider is the aws.CredentialsProvider that mints one role's
+// credentials via sso:GetRoleCredentials. The enclosing aws.CredentialsCache
+// owns caching, the expiry window, and single-flight refresh.
+type roleProvider struct {
+	client  *sso.Client
+	token   string
+	account string
+	role    string
+}
+
+// Retrieve mints fresh credentials from the SSO portal.
+func (p *roleProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
+	out, err := p.client.GetRoleCredentials(ctx, &sso.GetRoleCredentialsInput{
+		AccessToken: aws.String(p.token),
+		AccountId:   aws.String(p.account),
+		RoleName:    aws.String(p.role),
+	})
+	if err != nil {
+		return aws.Credentials{}, fmt.Errorf("sso GetRoleCredentials: %w", err)
+	}
+
+	rc := out.RoleCredentials
+	if rc == nil {
+		return aws.Credentials{}, errors.New("sso GetRoleCredentials: empty role credentials")
+	}
+
+	// Guard a zero/negative expiration rather than caching a permanently
+	// expired entry (Expiration is epoch milliseconds).
+	if rc.Expiration <= 0 {
+		return aws.Credentials{}, fmt.Errorf("sso GetRoleCredentials: non-positive expiration %d", rc.Expiration)
+	}
+
+	// Fail closed on empty credential material: a malformed-but-200 response
+	// (roleCredentials present, valid expiration, but empty key material —
+	// aws.ToString(nil) → "") would otherwise be cached until expiry, signing
+	// every request with empty keys with no re-mint until the window opens.
+	// SSO role credentials are always session credentials, so all three must
+	// be non-empty. Mirror of the core credential's minter.
+	akid := aws.ToString(rc.AccessKeyId)
+	secret := aws.ToString(rc.SecretAccessKey)
+	sessionToken := aws.ToString(rc.SessionToken)
+	if akid == "" || secret == "" || sessionToken == "" {
+		return aws.Credentials{}, errors.New("sso GetRoleCredentials: empty credential material (missing access key, secret, or session token)")
+	}
+
+	return aws.Credentials{
+		AccessKeyID:     akid,
+		SecretAccessKey: secret,
+		SessionToken:    sessionToken,
+		Source:          "aws_sso GetRoleCredentials",
+		AccountID:       p.account,
+		CanExpire:       true,
+		Expires:         time.UnixMilli(rc.Expiration),
+	}, nil
+}
