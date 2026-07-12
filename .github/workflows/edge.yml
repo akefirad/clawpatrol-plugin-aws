@@ -1,0 +1,112 @@
+name: edge
+
+# Rolling "nightly"-style build of the AWS SSO plugin for the clawgateway
+# Raspberry Pi. Mirrors the gateway's own edge workflow
+# (akefirad/clawpatrol .github/workflows/edge.yml): every push to a feature
+# branch rebuilds the static Linux binaries and republishes them under a single
+# prerelease tagged `edge`, so the Pi's cloud-init can re-fetch the latest build
+# with a plain unauthenticated curl.
+#
+# `edge` is a PRERELEASE, so GitHub intentionally excludes it from
+# `releases/latest`. Always fetch it via the fixed tag URL, e.g.:
+#   https://github.com/akefirad/clawpatrol-plugin-aws/releases/download/edge/clawpatrol-plugin-aws-linux-arm64
+#   https://github.com/akefirad/clawpatrol-plugin-aws/releases/download/edge/SHA256SUMS
+#   https://github.com/akefirad/clawpatrol-plugin-aws/releases/download/edge/VERSION
+#
+# The binary is installed on the Pi at /usr/local/lib/clawpatrol/aws-plugin —
+# the same path the Docker image uses — so gateway.hcl's
+# `plugin "aws" { source = ... }` is identical across both deployments.
+
+on:
+  push:
+    branches: ["gh-**"] # feature branches only — never main
+  workflow_dispatch:
+
+# A single `edge` tag/release is a shared, mutable pointer, so overlapping
+# runs would race to move it. Serialise; the newest push wins.
+concurrency:
+  group: edge-release
+  cancel-in-progress: true
+
+# Belt-and-suspenders: the plugin binary never phones home, but set DO_NOT_TRACK
+# so any future job that runs it can't pollute an active-gateway count.
+env:
+  DO_NOT_TRACK: "1"
+
+permissions:
+  contents: write # move the `edge` tag + (re)publish the prerelease
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ hashFiles('go.mod', 'go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ hashFiles('go.mod', 'go.sum') }}-
+            go-${{ runner.os }}-
+
+      - name: build binaries
+        env:
+          CGO_ENABLED: "0" # fully static; lets us cross-compile arm64 with no toolchain
+        run: |
+          set -eu
+          mkdir -p out
+          short_sha="${GITHUB_SHA:0:7}"
+          built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          # Timestamp answers "is this newer?"; short SHA answers "which
+          # commit?". The full SHA rides along in git_sha below. The plugin's
+          # main.go carries no build-version vars, so provenance lives in the
+          # VERSION manifest rather than in -ldflags -X (keeps the fork minimal).
+          version="edge-$(date -u +%Y%m%d%H%M%S)-${short_sha}"
+          echo "building $version"
+          # arm64 is the Pi (clawgateway) target; amd64 is for local/CI
+          # smoke-testing the exact same build. Drop amd64 if unused.
+          for arch in arm64 amd64; do
+            GOOS=linux GOARCH="$arch" go build \
+              -ldflags "-s -w" \
+              -trimpath \
+              -o "out/clawpatrol-plugin-aws-linux-${arch}" ./cmd/clawpatrol-plugin-aws
+          done
+          # Tiny manifest so you can see what's published without pulling the
+          # binary: curl .../edge/VERSION
+          {
+            echo "version:  $version"
+            echo "git_sha:  $GITHUB_SHA"
+            echo "git_ref:  $GITHUB_REF_NAME"
+            echo "built_at: $built_at"
+          } > out/VERSION
+          ( cd out && sha256sum clawpatrol-plugin-aws-linux-* VERSION > SHA256SUMS )
+          echo "--- VERSION ---";     cat out/VERSION
+          echo "--- SHA256SUMS ---";  cat out/SHA256SUMS
+
+      - name: publish rolling `edge` prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          # Move the rolling tag onto this commit.
+          git tag -f edge
+          git push -f origin edge
+          # Recreate the prerelease fresh so its assets + notes always match
+          # the current tag. --cleanup-tag=false keeps the tag we just moved.
+          gh release delete edge --yes --cleanup-tag=false 2>/dev/null || true
+          gh release create edge \
+            --prerelease \
+            --verify-tag \
+            --title "edge — rolling build" \
+            --notes "Rolling build of \`${GITHUB_REF_NAME}\` @ \`${GITHUB_SHA}\`.
+          Prerelease — excluded from \`releases/latest\`; fetch via the fixed \`edge\` tag URL." \
+            out/clawpatrol-plugin-aws-linux-arm64 \
+            out/clawpatrol-plugin-aws-linux-amd64 \
+            out/SHA256SUMS \
+            out/VERSION
